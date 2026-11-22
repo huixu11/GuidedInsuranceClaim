@@ -9,5 +9,6 @@ venv
 .gitignore
 tests
 scripts
+docs
 *.zip
 .claude

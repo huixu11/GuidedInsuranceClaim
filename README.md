@@ -11,6 +11,8 @@ verified, no policy or claim data is loaded into the model's context at all, the
 tools, and it cannot change the phase — so there is nothing for a persuasive or upset caller to
 talk it into.
 
+![The test UI mid-conversation: chat on the left, SOP inspector on the right](docs/ui-process-case.png)
+
 ---
 
 ## Quick start
@@ -66,13 +68,28 @@ Left: the chat. Right: the **SOP inspector**, which shows what the harness is do
 - **Turn trace** — for every turn: the structured reading, memory writes, gate decisions, tool
   calls, phase transitions, the directive given to the model, model calls and guard results.
 
+The row of buttons at the top of the inspector jumps to a section; a dot marks the sections
+that changed in the latest turn.
+
+**Suggested replies** above the message box change with the phase. The first one, marked with an
+arrow, carries the demo forward, so the whole workflow can be walked by clicking it and pressing
+Enter four times; the others are detours worth trying at that point (a frustrated caller, an
+off-topic question, a refusal, a request for a human). Clicking one fills the message box so it
+can be edited before sending. **All examples** lists every suggestion by phase.
+
+When the summary email is sent it appears in the chat under the agent's reply, as well as in the
+inspector's outbox. A conversation survives a page reload, and `?session=<id>` opens an existing
+one (sessions live in server memory, so a server restart starts fresh).
+
+![The last step: the summary email shown in the chat after the caller chose to send it](docs/ui-email-summary.png)
+
 **Test data** (top bar) lists the fixture identities and claims so you know what to type.
 **Consent scenario** selects how the simulated policyholder-consent service behaves for the next
 conversation (`default`: approved on the second check; `timeout`: never approved).
 
 ### A five-minute walkthrough
 
-Start a new conversation for each block. The chips above the composer contain these messages.
+Start a new conversation for each block. Most of these messages are among the suggested replies.
 
 1. **The demo test case** — one message with identity, policy number and the reason for calling:
    > I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm calling about my denied

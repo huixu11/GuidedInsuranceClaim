@@ -30,37 +30,133 @@ settings = load_settings()
 repo = Repository.load()
 agent = Agent(repo, settings)
 
-SAMPLE_PROMPTS = [
+# Suggested caller messages for the test UI, tagged with where in the SOP they make sense.
+#   phases      The phases the suggestion fits.
+#   happy_path  The one that carries the demo forward from there; the UI lists it first and
+#               marks it as the suggested next step. The others are detours worth trying.
+#   then        Optional, on a happy-path one: once it has been sent in the current visit to
+#               the phase, the suggestion with this label is marked as the next step instead.
+#   when        Optional: only at one point of those phases, named after what the agent is
+#               waiting for - "consent" (a representative waits for the policyholder's
+#               consent), "email_offer" (send or skip the email summary?) or "wrapped_up" (the
+#               conversation is completed; a follow-up re-opens it). Suggestions without it
+#               are for the phase's other turns, and are also shown at a point that has no
+#               suggestions of its own. Nothing is suggested once a call is escalated.
+# After VERIFY_ID the texts name no one, so they suit any of the fixture callers.
+SAMPLE_PROMPTS: list[dict[str, Any]] = [
+    # -- VERIFY_ID ----------------------------------------------------------------------
     {
         "label": "Demo test case",
         "text": (
             "I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm calling about my "
             "denied healthcare claim from January. DOB is 1985-03-15, SSN last four is 4472."
         ),
+        "phases": ["VERIFY_ID"],
+        "happy_path": True,
     },
-    {"label": "Intent before ID", "text": "Hi, I'm calling about my denied healthcare claim from January."},
-    {"label": "Partial ID", "text": "My name is Margaret Chen and my date of birth is March 15, 1985."},
+    {
+        "label": "Intent before ID",
+        "text": "Hi, I'm calling about my denied healthcare claim from January.",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Partial ID",
+        "text": "My name is Margaret Chen and my date of birth is March 15, 1985.",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Phone + email",
+        "text": "My phone is 650-521-2836 and my email is margaret@email.com.",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Won't share SSN",
+        "text": "I'm Margaret Chen, but I'm not comfortable giving my SSN. Is there something else I can use?",
+        "phases": ["VERIFY_ID"],
+    },
     {
         "label": "Frustrated caller",
         "text": "I already told you who I am. This is ridiculous. Just tell me why my claim was denied.",
+        "phases": ["VERIFY_ID"],
     },
-    {"label": "Won't share SSN", "text": "I'm not comfortable giving my SSN. Is there something else I can use?"},
-    {"label": "Phone + email", "text": "My phone is 650-521-2836 and my email is margaret@email.com."},
-    {"label": "Out of scope", "text": "What is RL?"},
     {
         "label": "Representative",
         "text": (
             "Hi, I'm David Chen, calling on behalf of my mother Margaret Chen about her denied claim. "
             "Her date of birth is 1985-03-15 and her phone is 650-521-2836."
         ),
+        "phases": ["VERIFY_ID"],
     },
     {
-        "label": "Document follow-up",
-        "text": "How do I submit the missing documents, and how long will the review take after that?",
+        "label": "Consent approved",
+        "text": "It's been approved now. Can you check again?",
+        "phases": ["VERIFY_ID"],
+        "when": ["consent"],
+        "happy_path": True,
     },
-    {"label": "Different claim", "text": "Can you also check on my auto claim?"},
-    {"label": "Ask for a human", "text": "I'd like to speak to a human representative, please."},
-    {"label": "Wrap up", "text": "That's all I needed, thanks."},
+    # -- RESOLVE_INTENT -------------------------------------------------------------------
+    {
+        "label": "Name the claim",
+        "text": "It's about the denied healthcare claim.",
+        "phases": ["RESOLVE_INTENT"],
+        "happy_path": True,
+    },
+    # -- PROCESS_CASE ---------------------------------------------------------------------
+    {
+        "label": "Document follow-up",
+        "text": "How do I submit the missing documents?",
+        "phases": ["PROCESS_CASE"],
+        "happy_path": True,
+        "then": "Wrap up",
+    },
+    {"label": "Why denied", "text": "Why was the claim denied?", "phases": ["PROCESS_CASE"]},
+    {"label": "Different claim", "text": "Can you also check on my auto claim?", "phases": ["PROCESS_CASE"]},
+    {
+        "label": "Frustrated caller",
+        "text": (
+            "This is ridiculous. I've been waiting for weeks and nobody can tell me what's going on "
+            "with my claim."
+        ),
+        "phases": ["PROCESS_CASE"],
+    },
+    {"label": "Wrap up", "text": "That's all I needed, thanks.", "phases": ["PROCESS_CASE"]},
+    # -- any phase before the wrap-up -------------------------------------------------------
+    {
+        "label": "Out of scope",
+        "text": "What is RL?",
+        "phases": ["VERIFY_ID", "RESOLVE_INTENT", "PROCESS_CASE"],
+    },
+    {
+        "label": "Ask for a human",
+        "text": "I'd like to speak to a human representative, please.",
+        "phases": ["VERIFY_ID", "RESOLVE_INTENT", "PROCESS_CASE"],
+    },
+    # -- POST_PROCESS ---------------------------------------------------------------------
+    {
+        "label": "Send the summary",
+        "text": "Yes, please send it.",
+        "phases": ["POST_PROCESS"],
+        "when": ["email_offer"],
+        "happy_path": True,
+    },
+    {
+        "label": "Skip the summary",
+        "text": "No thanks, skip the email.",
+        "phases": ["POST_PROCESS"],
+        "when": ["email_offer"],
+    },
+    {
+        "label": "Work address instead",
+        "text": "Please send it to my work address instead.",
+        "phases": ["POST_PROCESS"],
+        "when": ["email_offer"],
+    },
+    {
+        "label": "One more question",
+        "text": "Actually, one more question: when is the appeal deadline?",
+        "phases": ["POST_PROCESS"],
+        "when": ["email_offer", "wrapped_up"],
+    },
 ]
 
 

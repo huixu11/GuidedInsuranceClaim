@@ -11,6 +11,7 @@
 
   const SVG_NS = 'http://www.w3.org/2000/svg';
   const KEY_STORAGE = 'sopDemo.apiKey';
+  const SESSION_STORAGE = 'sopDemo.session'; // { id, scenario } of the conversation shown in this tab
   const DEFAULT_TIMEOUT_MS = 30000;
   const MESSAGE_TIMEOUT_MS = 180000;
 
@@ -86,6 +87,27 @@
     national_id_last4: 'National ID (last 4)',
   };
 
+  // Points inside a phase that have suggestions of their own (the `when` tags of
+  // SAMPLE_PROMPTS in server.py; see suggestionMoment()). [suggestion bar, examples dialog]
+  const MOMENT_TEXT = {
+    consent: ['Waiting for consent', 'While a representative waits for the policyholder’s consent'],
+    email_offer: ['Email summary offer', 'When the agent offers the email summary'],
+    wrapped_up: ['After the wrap-up', 'After the conversation is wrapped up'],
+  };
+
+  // Inspector sections in display order: [key, label in the section nav, card renderer].
+  const INSPECTOR_SECTIONS = [
+    ['workflow', 'Workflow', cardWorkflow],
+    ['verification', 'Identity', cardVerification],
+    ['memory', 'Memory', cardMemory],
+    ['case', 'Case', cardCase],
+    ['guardrails', 'Guardrails', cardGuardrails],
+    ['escalation', 'Escalation', cardEscalation],
+    ['email', 'Email', cardEmail],
+    ['trace', 'Trace', cardTrace],
+    ['raw', 'Raw JSON', cardRaw],
+  ];
+
   // 16x16 stroke icons (path data only; rendered with createElementNS).
   const ICONS = {
     check: ['M3.5 8.5 6.5 11.5 12.5 4.5'],
@@ -111,6 +133,9 @@
     user: ['M8 2.5a2.5 2.5 0 1 0 0 5a2.5 2.5 0 1 0 0-5z', 'M3 13.5c.6-2.6 2.6-4 5-4s4.4 1.4 5 4'],
     pause: ['M6 4.5v7', 'M10 4.5v7'],
     history: ['M3 8a5 5 0 1 0 1.46-3.54', 'M3 2.5V5h2.5', 'M8 5.5V8l1.75 1.25'],
+    arrow: ['M3 8h9.5', 'M9 4.5 12.5 8 9 11.5'],
+    list: ['M6 4.5h7.5', 'M6 8h7.5', 'M6 11.5h7.5', 'M2.75 4.5h.01', 'M2.75 8h.01', 'M2.75 11.5h.01'],
+    more: ['M3.5 8h.01', 'M8 8h.01', 'M12.5 8h.01'],
   };
 
   /* ==================================================================== state */
@@ -140,10 +165,17 @@
     memKey: '',
     typingTimer: 0,
     firstSession: true,
+    userTurns: [], // { turn, text } of every caller message in this conversation
+    suggestKey: null, // what the suggestion bar shows, to skip needless re-renders
+    navChanged: new Set(), // inspector sections the latest turn changed
+    menuOpen: false,
+    menuReturn: false, // a dialog was opened from the header menu
+    emailSeq: 0,
   };
 
   const dom = {};
   const mqMobile = window.matchMedia('(max-width: 899px)');
+  const mqCompact = window.matchMedia('(max-width: 640px)'); // header controls fold into a menu
   const mqReduced = window.matchMedia('(prefers-reduced-motion: reduce)');
   const mqCoarse = window.matchMedia('(pointer: coarse)');
 
@@ -417,12 +449,71 @@
     }
   }
 
+  /* -------------------------------------- which conversation this tab shows */
+
+  // Kept in sessionStorage so a reload reopens the same conversation. Without storage
+  // (private mode, blocked site data) a reload simply starts a new one.
+  function isSessionId(v) {
+    return typeof v === 'string' && /^[A-Za-z0-9_-]{1,128}$/.test(v);
+  }
+
+  function storedSession() {
+    try {
+      const v = JSON.parse(window.sessionStorage.getItem(SESSION_STORAGE) || 'null');
+      if (isObj(v) && isSessionId(v.id)) return { id: v.id, scenario: str(v.scenario) };
+    } catch (_) {
+      /* unavailable or unreadable: nothing stored */
+    }
+    return null;
+  }
+
+  function storeSession(id, scenario) {
+    try {
+      window.sessionStorage.setItem(SESSION_STORAGE, JSON.stringify({ id, scenario: scenario || '' }));
+    } catch (_) {
+      /* not persisted; a reload starts a new conversation */
+    }
+  }
+
+  function forgetStoredSession() {
+    try {
+      window.sessionStorage.removeItem(SESSION_STORAGE);
+    } catch (_) {
+      /* nothing to forget */
+    }
+  }
+
+  // ?session=<id> opens that conversation (and wins over the stored one).
+  function urlSessionParam() {
+    try {
+      return new URLSearchParams(window.location.search).get('session');
+    } catch (_) {
+      return null;
+    }
+  }
+
+  // Drop ?session= once the tab shows another conversation, so a reload keeps that one.
+  function clearUrlSession() {
+    try {
+      const url = new URL(window.location.href);
+      if (!url.searchParams.has('session')) return;
+      url.searchParams.delete('session');
+      window.history.replaceState(window.history.state, '', `${url.pathname}${url.search}${url.hash}`);
+    } catch (_) {
+      /* leave the address as it is */
+    }
+  }
+
   /* ===================================================================== init */
 
   function cacheDom() {
     const ids = {
       app: 'app',
       appName: 'app-name',
+      appNameFull: 'app-name-full',
+      appNameShort: 'app-name-short',
+      headerMenu: 'header-menu',
+      btnMenu: 'btn-menu',
       chipClock: 'chip-clock',
       chipClockValue: 'chip-clock-value',
       chipModel: 'chip-model',
@@ -445,11 +536,14 @@
       chatTyping: 'chat-typing',
       chatStatus: 'chat-status',
       samples: 'samples',
+      samplesLabel: 'samples-label',
       samplesList: 'samples-list',
+      btnExamples: 'btn-examples',
       composer: 'composer',
       input: 'composer-input',
       btnSend: 'btn-send',
       inspector: 'inspector',
+      inspectorNav: 'inspector-nav',
       inspectorSub: 'inspector-sub',
       srStatus: 'sr-status',
       keyDialog: 'key-dialog',
@@ -463,6 +557,8 @@
       keyClose: 'key-close',
       drawer: 'fixtures-drawer',
       fixturesBody: 'fixtures-body',
+      examplesDialog: 'examples-dialog',
+      examplesBody: 'examples-body',
     };
     Object.keys(ids).forEach((k) => {
       dom[k] = document.getElementById(ids[k]);
@@ -474,12 +570,26 @@
       startSession();
     });
     dom.btnKey.addEventListener('click', () => {
+      leaveMenu();
       openKeyDialog();
     });
-    dom.btnFixtures.addEventListener('click', openFixtures);
+    dom.btnFixtures.addEventListener('click', () => {
+      leaveMenu();
+      openFixtures();
+    });
     dom.consentSelect.addEventListener('change', () => {
       announce(`Consent scenario ${dom.consentSelect.value} will be used for the next new conversation.`);
     });
+    dom.btnMenu.addEventListener('click', () => setMenuOpen(!app.menuOpen));
+    dom.btnMenu.addEventListener('keydown', onMenuKeydown);
+    dom.headerMenu.addEventListener('keydown', onMenuKeydown);
+    dom.headerMenu.addEventListener('focusout', onMenuFocusOut);
+    document.addEventListener('pointerdown', onDocumentPointerDown);
+
+    dom.btnExamples.addEventListener('click', openExamples);
+    dom.inspectorNav.addEventListener('click', onInspectorNavClick);
+    bindScrollRow(dom.samplesList);
+    bindScrollRow(dom.inspectorNav);
 
     dom.composer.addEventListener('submit', (e) => {
       e.preventDefault();
@@ -506,13 +616,16 @@
     });
     dom.keyDialog.addEventListener('close', onDialogClosed);
     dom.drawer.addEventListener('close', onDialogClosed);
-    dom.drawer.addEventListener('click', onDrawerClick);
+    dom.drawer.addEventListener('click', onBackdropClick);
     dom.fixturesBody.addEventListener('click', onFixturesClick);
+    dom.examplesDialog.addEventListener('close', onDialogClosed);
+    dom.examplesDialog.addEventListener('click', onBackdropClick);
     document.querySelectorAll('dialog [data-close]').forEach((btn) => {
       btn.addEventListener('click', () => closeDialog(btn.closest('dialog')));
     });
 
     onMediaChange(mqMobile, applyLayoutMode);
+    onMediaChange(mqCompact, () => setMenuOpen(false));
   }
 
   function init() {
@@ -549,13 +662,27 @@
     if (cfg.fixtures_exposed) loadFixtures();
     else dom.btnFixtures.hidden = true;
     if (cfg.llm_mode === 'anthropic' && !cfg.has_server_key && !getApiKey()) openKeyDialog();
-    startSession();
+    openInitialConversation();
+  }
+
+  // After a reload, reopen the conversation this tab was showing (or the one named by
+  // ?session=); otherwise start a new one.
+  function openInitialConversation() {
+    const param = urlSessionParam();
+    const fromUrl = isSessionId(param) ? param : '';
+    if (param !== null && !fromUrl) clearUrlSession();
+    const stored = storedSession();
+    const id = fromUrl || (stored ? stored.id : '');
+    if (id) restoreSession(id, stored && stored.id === id ? stored.scenario : '');
+    else startSession();
   }
 
   function applyConfig() {
     const c = app.config;
     const name = str(c.app_name) || 'Claims Support — SOP Agent Demo';
-    dom.appName.textContent = name;
+    dom.appNameFull.textContent = name;
+    // Narrow screens show the name without its " — SOP Agent Demo" style suffix.
+    dom.appNameShort.textContent = name.split(/\s+[—–]\s+/)[0].trim() || name;
     dom.appName.title = name;
     document.title = name;
 
@@ -591,25 +718,108 @@
     if (scenarios.indexOf(previous) >= 0) dom.consentSelect.value = previous;
     else dom.consentSelect.value = scenarios.indexOf('default') >= 0 ? 'default' : scenarios[0];
 
-    renderSamples();
+    app.suggestKey = null;
+    renderSuggestions();
     updateKeyChip();
     updateHeads();
   }
 
-  function renderSamples() {
-    const prompts = arr(app.config.sample_prompts).filter((p) => isObj(p) && str(p.text));
-    dom.samplesList.replaceChildren(...prompts.map((p) => {
+  /* ------------------------------------------------------------- suggestions */
+
+  // The suggested caller messages (SAMPLE_PROMPTS in server.py), read defensively.
+  function samplePrompts() {
+    return arr(app.config.sample_prompts).filter((p) => isObj(p) && str(p.text)).map((p) => {
       const text = str(p.text);
-      const label = str(p.label) || (text.length > 40 ? `${text.slice(0, 40)}…` : text);
-      return el('button', {
-        type: 'button',
-        class: 'sample',
-        title: text,
-        onclick: () => useSample(text),
-      }, label);
-    }));
-    dom.samples.hidden = prompts.length === 0;
-    updateComposerState();
+      return {
+        label: str(p.label) || (text.length > 40 ? `${text.slice(0, 40)}…` : text),
+        text,
+        phases: arr(p.phases).map(str).filter(Boolean), // none: any phase
+        when: (Array.isArray(p.when) ? p.when : [p.when]).map(str).filter(Boolean),
+        happy: p.happy_path === true,
+        then: str(p.then),
+      };
+    });
+  }
+
+  // The point the conversation has reached inside its phase, for the suggestions'
+  // `when` tags: what the agent is waiting for, or '' for an ordinary turn.
+  function suggestionMoment() {
+    if (!app.state) return '';
+    if (statusOf() === 'completed') return 'wrapped_up';
+    const phase = str(stateOf('phase'));
+    if (phase === 'POST_PROCESS') {
+      const em = obj(stateOf('email'));
+      if (em.offered === true && !em.decision) return 'email_offer';
+    }
+    if (phase === 'VERIFY_ID' && str(obj(obj(stateOf('verification')).consent).status) === 'pending') return 'consent';
+    return '';
+  }
+
+  function normText(v) {
+    return str(v).replace(/\s+/g, ' ').trim().toLowerCase();
+  }
+
+  // What the caller has said since the conversation (last) entered this phase.
+  function sentInPhase(phase) {
+    let entered = 0;
+    arr(stateOf('phase_history')).forEach((h) => {
+      if (isObj(h) && h.to === phase && isNum(h.turn)) entered = Math.max(entered, h.turn);
+    });
+    return new Set(app.userTurns.filter((m) => m.turn > entered).map((m) => normText(m.text)));
+  }
+
+  // What to offer now: the suggestions tagged for this point of the phase, else the phase's
+  // general ones, with the happy-path step first and flagged as the suggested next step.
+  function currentSuggestions() {
+    if (!app.state || !canSend()) return { items: [], context: '' };
+    const phase = str(stateOf('phase'));
+    const moment = suggestionMoment();
+    const inPhase = samplePrompts().filter((p) => !p.phases.length || p.phases.indexOf(phase) >= 0);
+    const specific = moment ? inPhase.filter((p) => p.when.indexOf(moment) >= 0) : [];
+    const list = specific.length ? specific : inPhase.filter((p) => !p.when.length);
+    // A happy-path step already sent in this phase hands the mark on to its `then`.
+    const said = sentInPhase(phase);
+    let next = list.find((p) => p.happy) || null;
+    const passed = new Set();
+    while (next && next.then && said.has(normText(next.text)) && !passed.has(next)) {
+      passed.add(next);
+      const target = next.then;
+      next = list.find((p) => p.label === target) || next;
+    }
+    const ordered = next ? [next].concat(list.filter((p) => p !== next)) : list;
+    return {
+      items: ordered.map((p) => Object.assign({}, p, { next: p === next })),
+      context: specific.length ? (MOMENT_TEXT[moment] || [humanize(moment)])[0] : phaseLabel(phase),
+    };
+  }
+
+  function renderSuggestions() {
+    const visible = Boolean(app.state) && canSend(); // nothing to suggest once escalated
+    const { items, context } = visible ? currentSuggestions() : { items: [], context: '' };
+    const key = [visible ? 'on' : 'off', context]
+      .concat(items.map((p) => `${p.next ? '>' : ''}${p.label}\u0000${p.text}`))
+      .join('\n');
+    if (key === app.suggestKey) return;
+    app.suggestKey = key;
+    dom.samplesLabel.replaceChildren(
+      el('span', { class: 'samples-title' }, 'Suggested replies'),
+      context ? el('span', { class: 'samples-context' }, ` · ${context}`) : null);
+    dom.samplesList.replaceChildren(...items.map(suggestionChip));
+    dom.samples.hidden = !visible;
+    dom.samplesList.scrollLeft = 0;
+    updateScrollFade(dom.samplesList);
+  }
+
+  function suggestionChip(p) {
+    return el('button', {
+      type: 'button',
+      class: p.next ? 'sample sample-next' : 'sample',
+      title: p.text,
+      onclick: () => useSample(p.text),
+    },
+    p.next ? icon('arrow') : null,
+    p.next ? el('span', { class: 'visually-hidden' }, 'Suggested next step: ') : null,
+    el('span', { class: 'sample-text' }, p.label));
   }
 
   function useSample(text) {
@@ -620,6 +830,70 @@
     updateComposerState();
     ta.focus();
     ta.setSelectionRange(text.length, text.length);
+  }
+
+  /* ------------------------------------------------------------ all examples */
+
+  function openExamples() {
+    renderExamples();
+    openDialog(dom.examplesDialog);
+    // Start at the examples for where the conversation is (as in the suggestion bar).
+    const first = dom.examplesBody.querySelector('.ex-list-current .ex-item')
+      || dom.examplesBody.querySelector('.ex-group-current .ex-item')
+      || dom.examplesBody.querySelector('.ex-item');
+    if (first) first.focus();
+  }
+
+  function renderExamples() {
+    const prompts = samplePrompts();
+    const current = app.state ? str(stateOf('phase')) : '';
+    const moment = suggestionMoment();
+    const groups = getPhases().map((ph) => {
+      const items = prompts.filter((p) => p.phases.indexOf(ph.id) >= 0);
+      if (!items.length) return null;
+      return exampleGroup(`ex-${ph.id}`, ph.label, ph.freedom, items, ph.id === current ? moment : null);
+    }).filter(Boolean);
+    const loose = prompts.filter((p) => !p.phases.length);
+    if (loose.length) groups.push(exampleGroup('ex-any', 'Any phase', '', loose, null));
+    dom.examplesBody.replaceChildren(...(groups.length
+      ? groups
+      : [el('p', { class: 'empty' }, 'No examples are configured on this server.')]));
+  }
+
+  // `moment`: null unless this is the conversation's phase; then the point reached in it ('' for
+  // an ordinary turn), whose list is marked as the current one.
+  function exampleGroup(titleId, title, freedom, items, moment) {
+    const isCurrent = moment !== null;
+    const moments = [];
+    items.forEach((p) => p.when.forEach((m) => {
+      if (moments.indexOf(m) < 0) moments.push(m);
+    }));
+    const atMoment = isCurrent && moments.indexOf(moment) >= 0;
+    const parts = [];
+    const general = items.filter((p) => !p.when.length);
+    if (general.length) parts.push(exampleList(general, isCurrent && !atMoment));
+    moments.forEach((m) => {
+      parts.push(el('h4', { class: 'ex-moment' }, MOMENT_TEXT[m] ? MOMENT_TEXT[m][1] : capitalize(humanize(m))));
+      parts.push(exampleList(items.filter((p) => p.when.indexOf(m) >= 0), atMoment && m === moment));
+    });
+    return el('section', { class: isCurrent ? 'ex-group ex-group-current' : 'ex-group', 'aria-labelledby': titleId },
+      el('h3', { class: 'ex-phase', id: titleId },
+        el('span', null, title),
+        freedom ? freedomTag(freedom) : null,
+        isCurrent ? el('span', { class: 'tag tag-current' }, 'current phase') : null),
+      parts);
+  }
+
+  function exampleList(items, isCurrent) {
+    return el('ul', { class: isCurrent ? 'ex-list ex-list-current' : 'ex-list' }, items.map((p) => el('li', null,
+      el('button', { type: 'button', class: 'ex-item', onclick: () => pickExample(p.text) },
+        el('span', { class: 'ex-label' }, p.label, p.happy ? el('span', { class: 'tag tag-next' }, 'happy path') : null),
+        el('span', { class: 'ex-text' }, p.text)))));
+  }
+
+  function pickExample(text) {
+    closeDialog(dom.examplesDialog);
+    useSample(text);
   }
 
   function updateKeyChip() {
@@ -865,17 +1139,23 @@
   function onDialogClosed() {
     window.setTimeout(() => {
       if (document.querySelector('dialog[open]')) return;
+      const fromMenu = app.menuReturn;
+      app.menuReturn = false;
       const active = document.activeElement;
-      if (!active || active === document.body) restoreComposerFocus(true);
+      if (active && active !== document.body) return;
+      // Opened from the header menu: its button went away with the menu, so return to the menu.
+      if (fromMenu && mqCompact.matches) dom.btnMenu.focus();
+      else restoreComposerFocus(true);
     }, 0);
   }
 
-  function onDrawerClick(e) {
+  function onBackdropClick(e) {
     // A click on the ::backdrop targets the dialog element itself, outside its box.
-    if (e.target !== dom.drawer) return;
-    const r = dom.drawer.getBoundingClientRect();
+    const d = e.currentTarget;
+    if (e.target !== d) return;
+    const r = d.getBoundingClientRect();
     const inside = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
-    if (!inside) closeDialog(dom.drawer);
+    if (!inside) closeDialog(d);
   }
 
   function openKeyDialog(opts) {
@@ -1004,6 +1284,67 @@
     if (dot) dot.hidden = true;
   }
 
+  // Narrow screens fold the consent scenario, API key and Test data into a menu.
+  function setMenuOpen(open, returnFocus) {
+    const wasOpen = app.menuOpen;
+    const show = Boolean(open) && mqCompact.matches;
+    app.menuOpen = show;
+    dom.btnMenu.setAttribute('aria-expanded', show ? 'true' : 'false');
+    dom.headerMenu.classList.toggle('is-open', show);
+    if (show && !wasOpen) {
+      const first = dom.headerMenu.querySelector('select, button:not([hidden])');
+      if (first) first.focus();
+    } else if (!show && wasOpen && returnFocus) {
+      dom.btnMenu.focus();
+    }
+  }
+
+  // Close the menu to open a dialog from it.
+  function leaveMenu() {
+    app.menuReturn = app.menuOpen;
+    setMenuOpen(false);
+  }
+
+  function onMenuKeydown(e) {
+    if (e.key !== 'Escape' || !app.menuOpen) return;
+    e.preventDefault();
+    setMenuOpen(false, true);
+  }
+
+  function onMenuFocusOut(e) {
+    const next = e.relatedTarget;
+    if (app.menuOpen && next && !dom.headerMenu.contains(next) && next !== dom.btnMenu) setMenuOpen(false);
+  }
+
+  function onDocumentPointerDown(e) {
+    if (!app.menuOpen || dom.headerMenu.contains(e.target) || dom.btnMenu.contains(e.target)) return;
+    setMenuOpen(false);
+  }
+
+  // A one-line row that scrolls sideways when it does not fit: the clipped edge fades out,
+  // and a mouse wheel scrolls it.
+  function bindScrollRow(row) {
+    row.addEventListener('scroll', () => updateScrollFade(row), { passive: true });
+    row.addEventListener('wheel', (e) => {
+      const max = row.scrollWidth - row.clientWidth;
+      if (e.ctrlKey || max < 2 || Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+      const delta = e.deltaMode === 1 ? e.deltaY * 16 : e.deltaY;
+      const next = clamp(row.scrollLeft + delta, 0, max);
+      if (Math.abs(next - row.scrollLeft) < 1) return; // at the end: the panel scrolls instead
+      row.scrollLeft = next;
+      e.preventDefault();
+    }, { passive: false });
+    if (typeof window.ResizeObserver === 'function') {
+      new window.ResizeObserver(() => updateScrollFade(row)).observe(row);
+    }
+  }
+
+  function updateScrollFade(row) {
+    const max = row.scrollWidth - row.clientWidth;
+    row.classList.toggle('fade-start', max > 1 && row.scrollLeft > 1);
+    row.classList.toggle('fade-end', max > 1 && row.scrollLeft < max - 1);
+  }
+
   /* ===================================================================== chat */
 
   function loadingRow(text) {
@@ -1030,7 +1371,8 @@
     return row;
   }
 
-  function appendAssistantMessage(text, turn, phase) {
+  // `emails`: outbox entries this turn "sent"; each is shown under the reply.
+  function appendAssistantMessage(text, turn, phase, emails) {
     const key = isNum(turn) ? String(turn) : null;
     const label = metaLabel(turn, phase);
     let meta = null;
@@ -1049,9 +1391,53 @@
       el('div', { class: 'msg-body' },
         el('span', { class: 'visually-hidden' }, `${agentName()} said: `),
         el('div', { class: text ? 'bubble' : 'bubble bubble-empty' }, text || '(empty reply)'),
+        arr(emails).filter(isObj).map(chatEmailCard),
         meta));
     dom.chatItems.appendChild(row);
+    row.querySelectorAll('.chat-email').forEach(fitChatEmail);
     return row;
+  }
+
+  // The outbox entries sent during a turn (each records the turn it was sent in).
+  function emailsForTurn(turn) {
+    if (!isNum(turn)) return [];
+    return arr(obj(stateOf('email')).outbox).filter((m) => isObj(m) && m.sent_turn === turn);
+  }
+
+  // The summary email, as the caller would get it: collapsed to a few lines until expanded.
+  function chatEmailCard(m) {
+    app.emailSeq += 1;
+    const bodyId = `chat-email-body-${app.emailSeq}`;
+    const toggleText = el('span', null, 'Show full email');
+    const toggle = el('button', {
+      type: 'button',
+      class: 'email-toggle',
+      'aria-expanded': 'false',
+      'aria-controls': bodyId,
+    }, icon('chevron', 'chev'), toggleText);
+    const node = el('div', { class: 'email chat-email', role: 'group', 'aria-label': 'Email summary sent' },
+      el('div', { class: 'email-head' },
+        icon('mail'),
+        el('div', { class: 'email-head-main' },
+          el('p', { class: 'email-caption' }, 'Email summary sent'),
+          emailMeta(m))),
+      el('div', { class: 'email-body', id: bodyId }, str(m.body) || '(empty body)'),
+      toggle);
+    toggle.addEventListener('click', () => {
+      const open = toggle.getAttribute('aria-expanded') !== 'true';
+      toggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+      node.classList.toggle('is-open', open);
+      toggleText.textContent = open ? 'Show less' : 'Show full email';
+    });
+    return node;
+  }
+
+  // An email that fits in the collapsed height needs no toggle. Measured once it is in the
+  // page; while the chat is hidden (other tab on a phone) the toggle simply stays.
+  function fitChatEmail(card) {
+    const body = card.querySelector('.email-body');
+    if (!body || !body.clientHeight) return;
+    if (body.scrollHeight <= body.clientHeight + 1) card.classList.add('is-short');
   }
 
   function appendSystemMessage(text) {
@@ -1093,7 +1479,7 @@
       const after = trace ? str(trace.phase_after) : '';
       if (before && after && before !== after) appendPhaseDivider(before, after);
       const phase = after || (turn !== null ? phaseAtTurn(turn) : '') || str(stateOf('phase'));
-      appendAssistantMessage(text, turn, phase);
+      appendAssistantMessage(text, turn, phase, emailsForTurn(turn));
       return;
     }
     appendSystemMessage(text);
@@ -1161,6 +1547,7 @@
     }
     dom.chatStatus.replaceChildren(...(node ? [node] : []));
     updateComposerState();
+    renderSuggestions();
     updateHeads();
   }
 
@@ -1273,7 +1660,7 @@
       handleSendError(error, text);
     } else {
       try {
-        handleReply(data);
+        handleReply(data, text);
       } catch (err) {
         // A rendering bug must not wedge the conversation; surface it instead.
         window.console.error(err);
@@ -1283,8 +1670,9 @@
     restoreComposerFocus(false);
   }
 
-  function handleReply(data) {
+  function handleReply(data, text) {
     const trace = isObj(data.trace) ? normalizeTrace(data.trace) : null;
+    const sentBefore = arr(obj(stateOf('email')).outbox).length;
     if (isObj(data.state)) app.state = data.state;
     if (trace) upsertTrace(trace);
 
@@ -1295,8 +1683,11 @@
 
     let turn = trace && isNum(trace.turn) ? trace.turn : null;
     if (turn === null && isNum(stateOf('turn'))) turn = stateOf('turn');
+    if (text) app.userTurns.push({ turn: isNum(turn) ? turn : 0, text });
     const phase = after || str(stateOf('phase'));
-    const row = appendAssistantMessage(str(data.reply), turn, phase);
+    let emails = emailsForTurn(turn);
+    if (!emails.length) emails = arr(obj(stateOf('email')).outbox).slice(sentBefore); // entries without a turn
+    const row = appendAssistantMessage(str(data.reply), turn, phase, emails);
 
     renderInspector();
     updateStatusUi();
@@ -1388,6 +1779,7 @@
       app.traces = [];
       data.traces.filter(isObj).forEach((t) => upsertTrace(normalizeTrace(t)));
     }
+    if (Array.isArray(data.messages)) app.userTurns = userTurnsOf(data.messages);
     renderInspector();
     updateStatusUi();
   }
@@ -1416,11 +1808,20 @@
     app.failed = null;
     app.sessionLost = false;
     app.pending = false;
+    app.userTurns = [];
+    app.navChanged = new Set();
+    app.suggestKey = null;
     showTyping(false);
     dom.chatItems.replaceChildren();
     dom.chatStatus.replaceChildren();
     clearUnread('chat');
     clearUnread('inspector');
+  }
+
+  function userTurnsOf(messages) {
+    return arr(messages)
+      .filter((m) => isObj(m) && m.role === 'user')
+      .map((m) => ({ turn: isNum(m.turn) ? m.turn : 0, text: str(m.text) }));
   }
 
   async function startSession() {
@@ -1469,16 +1870,76 @@
       return;
     }
 
+    const time = clockTime();
+    presentConversation(data, scenario,
+      `New conversation · consent scenario “${scenario}”${time ? ` · ${time}` : ''}`);
+    if (app.sessionId) clearUrlSession(); // the address no longer names the conversation shown
+  }
+
+  // Reopen a conversation the server still has (after a reload, or from ?session=<id>).
+  async function restoreSession(id, scenario) {
+    abortInFlight();
+    app.gen += 1;
+    const gen = app.gen;
+    resetConversation();
+    app.starting = true;
+    renderInspector();
+    updateStatusUi();
+
+    const loading = loadingRow('Reopening the conversation…');
+    dom.chatItems.appendChild(loading);
+    const controller = new AbortController();
+    app.sessionController = controller;
+
+    let data = null;
+    let error = null;
+    try {
+      data = await api('GET', `/api/sessions/${encodeURIComponent(id)}`, undefined, { controller });
+    } catch (err) {
+      error = toApiError(err);
+    }
+    if (gen !== app.gen) return;
+    app.sessionController = null;
+    app.starting = false;
+    loading.remove();
+
+    if (error && (error.code === 'session_not_found' || error.status === 404)) {
+      // Gone (expired, or the server restarted): quietly start over.
+      forgetStoredSession();
+      clearUrlSession();
+      startSession();
+      return;
+    }
+    if (error) {
+      if (error.code !== 'aborted') {
+        dom.chatItems.appendChild(errorBlock('Could not reopen the conversation', error, () => {
+          restoreSession(id, scenario);
+        }));
+      }
+      renderInspector();
+      updateStatusUi();
+      return;
+    }
+    if (!data.session_id) data.session_id = id;
+    presentConversation(data, scenario,
+      `Conversation reopened${scenario ? ` · consent scenario “${scenario}”` : ''}`);
+  }
+
+  // Show a conversation as the server returned it: transcript (with phase dividers and sent
+  // emails), state and traces.
+  function presentConversation(data, scenario, dividerText) {
     const sid = data.session_id;
     app.sessionId = sid !== null && sid !== undefined && sid !== '' ? String(sid) : null;
-    app.sessionScenario = scenario;
+    app.sessionScenario = scenario || null;
     app.state = isObj(data.state) ? data.state : null;
     if (Array.isArray(data.traces)) data.traces.filter(isObj).forEach((t) => upsertTrace(normalizeTrace(t)));
+    app.userTurns = userTurnsOf(data.messages);
 
-    const time = clockTime();
-    appendDivider(`New conversation · consent scenario “${scenario}”${time ? ` · ${time}` : ''}`, false);
+    appendDivider(dividerText, false);
     arr(data.messages).forEach(renderHistoryMessage);
-    if (!app.sessionId) {
+    if (app.sessionId) {
+      storeSession(app.sessionId, app.sessionScenario);
+    } else {
       dom.chatItems.appendChild(errorBlock('The server did not return a session id',
         new ApiError('bad_response', 'Messages cannot be sent without a session id.'), () => {
           startSession();
@@ -1582,9 +2043,12 @@
   function makeCtx() {
     const sigs = new Map();
     const nodes = new Map();
-    return {
+    const owners = new Map(); // tracked key -> the inspector section it was rendered in
+    const ctx = {
       sigs,
       nodes,
+      owners,
+      section: '', // the section being rendered
       // Register a rendered node whose value should flash when it changes between turns.
       track(node, key, value) {
         let sig;
@@ -1594,11 +2058,13 @@
           sig = String(value);
         }
         sigs.set(key, sig);
+        owners.set(key, ctx.section);
         if (!nodes.has(key)) nodes.set(key, []);
         nodes.get(key).push(node);
         return node;
       },
     };
+    return ctx;
   }
 
   function flash(node) {
@@ -1631,36 +2097,83 @@
   function renderInspector() {
     const focusKey = activeFocusKey();
     const ctx = makeCtx();
-    let cards;
+    const cards = [];
+    const shown = []; // [key, nav label] of the sections rendered
     if (!app.state) {
-      cards = [placeholderCard()];
+      cards.push(placeholderCard());
     } else {
-      cards = [
-        cardWorkflow(ctx),
-        cardVerification(ctx),
-        cardMemory(ctx),
-        cardCase(ctx),
-        cardGuardrails(ctx),
-        cardEscalation(ctx),
-        cardEmail(ctx),
-        cardTrace(ctx),
-        cardRaw(),
-      ].filter(Boolean);
+      INSPECTOR_SECTIONS.forEach(([key, label, render]) => {
+        ctx.section = key;
+        const node = render(ctx);
+        if (!node) return;
+        cards.push(node);
+        shown.push([key, label]);
+      });
     }
     dom.inspector.replaceChildren(...cards);
 
-    let changed = 0;
+    const touched = new Set(); // sections with a changed value
     if (app.prevSigs && app.state) {
       ctx.sigs.forEach((sig, key) => {
         if (app.prevSigs.get(key) === sig) return;
-        changed += 1;
+        touched.add(ctx.owners.get(key));
         (ctx.nodes.get(key) || []).forEach((n) => flash(n));
       });
     }
     app.prevSigs = app.state ? ctx.sigs : null;
-    if (changed && isMobile() && app.activeTab !== 'inspector') markUnread('inspector');
+    // The nav marks what the latest turn changed; a re-render that changes nothing keeps that.
+    if (!app.state) app.navChanged = new Set();
+    else if (touched.size) app.navChanged = touched;
+    renderInspectorNav(shown);
+    if (touched.size && isMobile() && app.activeTab !== 'inspector') markUnread('inspector');
     restoreFocusKey(focusKey);
     updateHeads();
+  }
+
+  // The row above the inspector: a button per section that scrolls to it, with a dot on the
+  // sections the latest turn changed.
+  function renderInspectorNav(sections) {
+    const nav = dom.inspectorNav;
+    const active = document.activeElement;
+    const focused = active && nav.contains(active) ? active.getAttribute('data-section') : null;
+    const left = nav.scrollLeft;
+    nav.replaceChildren(...sections.map(([key, label]) => {
+      const changed = app.navChanged.has(key);
+      return el('button', {
+        type: 'button',
+        class: changed ? 'inav-btn is-changed' : 'inav-btn',
+        'data-section': key,
+        title: changed ? `${label} changed in the latest turn` : null,
+      },
+      label,
+      changed ? el('span', { class: 'inav-dot', 'aria-hidden': 'true' }) : null,
+      changed ? el('span', { class: 'visually-hidden' }, ' (changed in the latest turn)') : null);
+    }));
+    nav.hidden = sections.length === 0;
+    nav.scrollLeft = left;
+    if (focused) {
+      const btn = nav.querySelector(`[data-section="${cssEscape(focused)}"]`);
+      if (btn) btn.focus({ preventScroll: true });
+    }
+    updateScrollFade(nav);
+  }
+
+  function onInspectorNavClick(e) {
+    const btn = e.target.closest('button[data-section]');
+    if (btn && dom.inspectorNav.contains(btn)) goToSection(btn.getAttribute('data-section'));
+  }
+
+  // Scroll a section to the top of the inspector and move focus to it, so the keyboard
+  // continues from there. Only the inspector scrolls: scrollIntoView can also pan the page
+  // on phones.
+  function goToSection(key) {
+    const box = dom.inspector;
+    const target = document.getElementById(`section-${key}`);
+    if (!target || !box.contains(target)) return;
+    const pad = parseFloat(window.getComputedStyle(box).scrollPaddingTop) || 0;
+    const top = box.scrollTop + target.getBoundingClientRect().top - box.getBoundingClientRect().top - pad;
+    box.scrollTo({ top: Math.max(0, top), behavior: mqReduced.matches ? 'auto' : 'smooth' });
+    target.focus({ preventScroll: true });
   }
 
   function updateHeads() {
@@ -1699,9 +2212,16 @@
       el('div', { class: 'card-body' }, el('p', { class: 'empty' }, text)));
   }
 
+  // Sections are focusable from script only (tabindex -1): the section nav moves focus to them.
   function card(key, title, headExtra, body) {
     const titleId = `card-${key}-title`;
-    return el('section', { class: `card card-${key}`, 'aria-labelledby': titleId },
+    return el('section', {
+      class: `card card-${key}`,
+      id: `section-${key}`,
+      tabindex: '-1',
+      'data-fkey': `section:${key}`,
+      'aria-labelledby': titleId,
+    },
       el('div', { class: 'card-head' }, el('h3', { class: 'card-title', id: titleId }, title), headExtra),
       el('div', { class: 'card-body' }, body));
   }
@@ -2080,11 +2600,16 @@
     return el('li', { class: 'email' },
       el('div', { class: 'email-head' },
         icon('mail'),
-        el('dl', { class: 'email-meta' },
-          el('div', null, el('dt', null, 'To'), el('dd', null, str(m.to) || '—')),
-          el('div', null, el('dt', null, 'Subject'), el('dd', null, str(m.subject) || '(no subject)'))),
+        emailMeta(m),
         isNum(m.sent_turn) ? el('span', { class: 'email-turn' }, `turn ${m.sent_turn}`) : null),
       el('div', { class: 'email-body' }, str(m.body) || '(empty body)'));
+  }
+
+  // Recipient (already masked by the server) and subject; shared with the card in the chat.
+  function emailMeta(m) {
+    return el('dl', { class: 'email-meta' },
+      el('div', null, el('dt', null, 'To'), el('dd', null, str(m.to) || '—')),
+      el('div', null, el('dt', null, 'Subject'), el('dd', null, str(m.subject) || '(no subject)')));
   }
 
   function traceTitle(t) {
@@ -2148,7 +2673,13 @@
       el('summary', { class: 'raw-summary', 'data-fkey': 'raw' }, icon('chevron', 'chev'), 'Raw state JSON'),
       el('pre', { class: 'json raw-json' }, prettyJson(app.state)));
     if (app.rawOpen) details.open = true;
-    return el('section', { class: 'card card-raw', 'aria-label': 'Raw state' }, el('div', { class: 'card-body' }, details));
+    return el('section', {
+      class: 'card card-raw',
+      id: 'section-raw',
+      tabindex: '-1',
+      'data-fkey': 'section:raw',
+      'aria-label': 'Raw state',
+    }, el('div', { class: 'card-body' }, details));
   }
 
   /* ===================================================================== boot */
