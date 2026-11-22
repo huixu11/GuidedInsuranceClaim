@@ -53,6 +53,24 @@ python -m insurance_claims --mock          # same as SOP_LLM_MODE=mock; --host /
 docker run --rm -p 8000:8000 -e SOP_LLM_MODE=mock sop-agent
 ```
 
+### Hosted demo
+
+`render.yaml` is a [Render](https://render.com) Blueprint that builds the same Dockerfile and
+serves it at a fixed `https://<name>.onrender.com` address, on the free plan:
+
+1. Sign in to Render with GitHub and give it access to this repository.
+2. **New → Blueprint**, pick the repository, **Apply**. The first build takes a few minutes.
+
+It starts in offline mode, so the whole workflow can be clicked through without a key. To run the
+live model, open the service's **Environment** tab and set `SOP_LLM_MODE` to `anthropic`, then
+either add `ANTHROPIC_API_KEY` there as a secret (everyone with the link then uses that key, so
+give it a spending limit) or leave it out, in which case each tester pastes a key into
+**Settings**. In offline mode a key pasted into Settings is ignored.
+
+Worth knowing about the free plan: the service stops after 15 minutes without traffic and takes
+about a minute to wake on the next request, and conversations live in server memory, so they
+start afresh after a wake-up or a redeploy. Every push to the default branch redeploys.
+
 ---
 
 ## Using the test UI
@@ -374,6 +392,7 @@ insurance_claims/
   state.py             session state and its display-safe view
   server.py            FastAPI app and API
   static/              the test UI (plain HTML/CSS/JS, no build step)
+render.yaml                  Render Blueprint for a hosted copy of the demo
 scripts/run_scenarios.py     scripted conversations against the live model (or offline)
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
 scripts/spec_check.py        the brief, requirement by requirement, against an offline instance

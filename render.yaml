@@ -1,0 +1,24 @@
+# Render Blueprint: a hosted copy of the demo, built from the Dockerfile in this repository.
+#
+#   render.com -> New -> Blueprint -> pick this repository -> Apply
+#
+# It starts in offline mode (no model, no key, fixed replies), which is enough to click through
+# the whole workflow. To run the live model instead, open the service's Environment tab and set
+# SOP_LLM_MODE to "anthropic", then either
+#   - add ANTHROPIC_API_KEY as a secret there: everyone with the link uses that key, or
+#   - leave it out: each tester pastes their own key into the UI's Settings dialog.
+# The README section "Hosted demo" has the details and the limits of the free plan.
+services:
+  - type: web
+    name: sop-claims-agent
+    runtime: docker
+    plan: free
+    region: virginia
+    healthCheckPath: /healthz
+    autoDeployTrigger: commit
+    envVars:
+      - key: SOP_LLM_MODE
+        value: mock
+      # The image listens on this port (HOST is already 0.0.0.0 in the Dockerfile).
+      - key: PORT
+        value: "8000"
