@@ -1,5 +1,8 @@
 # SOP-Guided Conversational Agent — Insurance Claims Support
 
+> Reviewing this as a submission? [SUBMISSION.md](SUBMISSION.md) is the one-page cover note: the
+> hosted demo, how to run it, a two-minute demo and how the brief is met.
+
 A claims-support agent that talks like a person but cannot leave the standard operating
 procedure. A deterministic harness owns the workflow
 (`VERIFY_ID → RESOLVE_INTENT → PROCESS_CASE → POST_PROCESS`), the safety gates, the memory and
@@ -404,6 +407,7 @@ insurance_claims/
   state.py             session state and its display-safe view
   server.py            FastAPI app and API
   static/              the test UI (plain HTML/CSS/JS, no build step)
+SUBMISSION.md                one-page cover note for reviewers
 render.yaml                  Render Blueprint for a hosted copy of the demo
 scripts/run_scenarios.py     scripted conversations against the live model (or offline)
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
