@@ -94,6 +94,72 @@ def test_missing_key_is_reported_in_model_mode(monkeypatch):
     assert err.value.code == "missing_api_key" and err.value.status == 401
 
 
+def test_auto_mode_answers_offline_until_a_key_is_available(client, monkeypatch):
+    """SOP_LLM_MODE=auto, as on the hosted demo: no key -> the offline double; the tester's key
+    -> the model with that key; a server key -> the model for everyone."""
+    import dataclasses
+
+    from insurance_claims.mock_llm import MockBackend
+
+    built: list[str | None] = []
+
+    class FakeModel(MockBackend):  # stands in for the Claude backend; records the key it was given
+        def __init__(self, settings, key=None):
+            super().__init__()
+            built.append(key)
+
+    monkeypatch.setattr(server, "settings", dataclasses.replace(server.settings, llm_mode="auto"))
+    monkeypatch.setattr(server, "AnthropicBackend", FakeModel)
+    monkeypatch.setattr(server, "_backends", {})
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+
+    cfg = client.get("/api/config").json()
+    assert cfg["llm_mode"] == "auto" and cfg["has_server_key"] is False
+    sid = client.post("/api/sessions", json={}).json()["session_id"]
+    url = f"/api/sessions/{sid}/messages"
+
+    out = client.post(url, json={"text": "My name is Margaret Chen."})
+    assert out.status_code == 200 and built == []  # no key anywhere: nothing but the double
+    assert isinstance(server.get_backend(None), MockBackend) and built == []
+
+    out = client.post(url, json={"text": "My date of birth is 1985-03-15."},
+                      headers={"X-API-Key": "test-key-from-the-tester"})
+    assert out.status_code == 200 and built == ["test-key-from-the-tester"]
+    client.post(url, json={"text": "What is RL?"})  # the next request without a key is offline again
+    assert built == ["test-key-from-the-tester"]
+
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key-on-the-server")
+    assert client.get("/api/config").json()["has_server_key"] is True
+    out = client.post(url, json={"text": "My phone is 650-521-2836."})
+    assert out.status_code == 200 and built == ["test-key-from-the-tester", None]  # the server's key
+    assert out.json()["state"]["verification"]["verified"]  # one conversation across both backends
+
+
+def test_mock_mode_ignores_a_key_and_model_mode_is_unchanged(client, monkeypatch):
+    import dataclasses
+
+    from insurance_claims.mock_llm import MockBackend
+
+    monkeypatch.setattr(server, "_backends", {})
+    assert isinstance(server.get_backend("some-key"), MockBackend)  # tests run in mock mode
+
+    monkeypatch.setattr(server, "settings", dataclasses.replace(server.settings, llm_mode="anthropic"))
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("ANTHROPIC_AUTH_TOKEN", raising=False)
+    sid = client.post("/api/sessions", json={}).json()["session_id"]
+    out = client.post(f"/api/sessions/{sid}/messages", json={"text": "hello"})
+    assert out.status_code == 401 and out.json()["error"]["code"] == "missing_api_key"
+
+
+def test_the_mode_setting_accepts_auto_and_falls_back_to_the_model(monkeypatch):
+    from insurance_claims.config import load_settings
+
+    for raw, expected in (("auto", "auto"), ("AUTO", "auto"), ("mock", "mock"), ("nonsense", "anthropic")):
+        monkeypatch.setenv("SOP_LLM_MODE", raw)
+        assert load_settings().llm_mode == expected
+
+
 def test_concurrent_messages_to_one_conversation_are_serialised(client, monkeypatch):
     """Two requests in flight for the same conversation must not overwrite each other."""
     import time

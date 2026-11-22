@@ -203,9 +203,20 @@ _backends_lock = threading.Lock()
 
 
 def get_backend(api_key: str | None) -> Any:
-    if settings.llm_mode == "mock":
-        return _backends.setdefault("mock", MockBackend())
+    """The backend that answers one request.
+
+    mock: always the offline double. anthropic: always the model, with the caller's key or else
+    the server's (neither: missing_api_key). auto: the model when a key is available from either
+    place, otherwise the offline double, so a hosted demo works without a key and each tester
+    who brings one gets the model.
+    """
     key = (api_key or "").strip() or None
+    offline = settings.llm_mode == "mock" or (
+        settings.llm_mode == "auto" and key is None and not server_has_credentials()
+    )
+    if offline:
+        with _backends_lock:
+            return _backends.setdefault("mock", MockBackend())
     cache_key = "server" if key is None else hashlib.sha256(key.encode()).hexdigest()
     with _backends_lock:
         backend = _backends.get(cache_key)

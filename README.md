@@ -20,7 +20,8 @@ talk it into.
 You need an Anthropic API key (the "API auth token") for the model. It can be supplied in any of
 three ways: the `ANTHROPIC_API_KEY` environment variable, a `.env` file (copy `.env.example`),
 or pasted into the UI's **Settings** dialog (kept in the browser tab, sent per request as an
-`X-API-Key` header — convenient for a hosted demo where each tester brings a key).
+`X-API-Key` header — convenient for a hosted demo where each tester brings a key; with
+`SOP_LLM_MODE=auto` such a demo also answers offline for testers who have none).
 
 ### Docker
 
@@ -65,11 +66,17 @@ serves it at a fixed `https://<name>.onrender.com` address, on the free plan:
    keep the `main` branch, review the one web service it lists and click **Deploy Blueprint**. The
    first build takes a few minutes.
 
-It starts in offline mode, so the whole workflow can be clicked through without a key. To run the
-live model, open the service's **Environment** tab and set `SOP_LLM_MODE` to `anthropic`, then
-either add `ANTHROPIC_API_KEY` there as a secret (everyone with the link then uses that key, so
-give it a spending limit) or leave it out, in which case each tester pastes a key into
-**Settings**. In offline mode a key pasted into Settings is ignored.
+The Blueprint sets `SOP_LLM_MODE=auto` and stores no key on the server:
+
+- **without a key** the offline test double answers, so anyone can click through the whole
+  workflow (the header says *offline mock model* and the Settings button reads **Add API key**);
+- **with the tester's own key**, saved in **Settings**, that browser tab talks to the live model
+  using that key. It is kept in the tab's `sessionStorage` and sent with each request; the server
+  does not store it. Clearing it goes back to offline, even mid-conversation.
+
+So the hosted demo never spends the owner's credit. To make it always use the live model instead,
+set `SOP_LLM_MODE=anthropic` in the service's **Environment** tab (testers without a key are then
+asked for one), optionally with `ANTHROPIC_API_KEY` as a secret there.
 
 Worth knowing about the free plan: the service stops after 15 minutes without traffic and takes
 about a minute to wake on the next request, and conversations live in server memory, so they
@@ -294,7 +301,7 @@ still be verified. No gate is ever relaxed as part of de-escalation.
 | Variable | Default | Meaning |
 |---|---|---|
 | `ANTHROPIC_API_KEY` | — | Model API auth token (or `ANTHROPIC_AUTH_TOKEN`; or paste a key in the UI) |
-| `SOP_LLM_MODE` | `anthropic` | `anthropic` or `mock` (offline test double) |
+| `SOP_LLM_MODE` | `anthropic` | `anthropic` (the model; a key is required), `mock` (offline test double) or `auto` (the model when a key is available — the tester's or the server's — otherwise the offline double) |
 | `SOP_MODEL` | `claude-opus-5-5` | Model that phrases replies |
 | `SOP_MODEL_UNDERSTAND` | `claude-haiku-5-5` | Model for the structured calls (understand / resolve / summarize); set it to the `SOP_MODEL` value to use one model for everything |
 | `SOP_EFFORT`, `SOP_EFFORT_UNDERSTAND` | `low` | Reasoning effort per call type |
@@ -357,8 +364,9 @@ model key: it builds the image, checks what is in it, starts it in offline mode,
 image's own `HEALTHCHECK`, confirms it runs as the non-root `appuser`, and plays the demo test
 case through all four phases over the published port, then checks the brief's requirements one by
 one (`scripts/spec_check.py`). It then starts a second container in model
-mode with no key (expects a clean `missing_api_key`), repeats the walk-through via
-`docker compose`, and runs the test suite inside `python:3.14-slim`.
+mode with no key (expects a clean `missing_api_key`), a third in `auto` mode with no key (the
+hosted demo's configuration, which must answer offline and pass the same requirement checks),
+repeats the walk-through via `docker compose`, and runs the test suite inside `python:3.14-slim`.
 
 The same walk-through by hand, against any running instance:
 

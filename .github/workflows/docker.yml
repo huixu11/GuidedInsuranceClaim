@@ -74,6 +74,19 @@ jobs:
       - name: A missing key is reported cleanly
         run: python3 scripts/docker_smoke.py http://127.0.0.1:8001 --no-key
 
+      - name: Start a container in auto mode without a key (the hosted demo's configuration)
+        run: |
+          docker run -d --name sop-auto -p 8003:8000 -e SOP_LLM_MODE=auto sop-agent
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8003/healthz > /dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs sop-auto
+          exit 1
+
+      - name: Auto mode answers offline when nobody supplies a key
+        run: python3 scripts/spec_check.py http://127.0.0.1:8003
+
       - name: docker compose builds, starts and serves the same workflow
         env:
           SOP_LLM_MODE: mock
@@ -92,6 +105,7 @@ jobs:
         run: |
           echo "--- offline mode ---"; docker logs sop-offline || true
           echo "--- model mode, no key ---"; docker logs sop-nokey || true
+          echo "--- auto mode, no key ---"; docker logs sop-auto || true
 
   tests:
     name: Test suite on the image's Python

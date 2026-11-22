@@ -84,7 +84,7 @@ def _env_bool(name: str, default: bool) -> bool:
 
 @dataclass(frozen=True)
 class Settings:
-    llm_mode: str  # "anthropic" | "mock"
+    llm_mode: str  # "anthropic" | "mock" | "auto" (the model when a key is available, else the mock)
     model_respond: str
     model_understand: str
     effort_respond: str  # low | medium | high | xhigh | max | none (omit)
@@ -133,7 +133,7 @@ def load_settings() -> Settings:
         except ValueError:
             today = date.fromisoformat(DEFAULT_DEMO_TODAY)
     mode = _env("SOP_LLM_MODE", "anthropic").lower()
-    if mode not in {"anthropic", "mock"}:
+    if mode not in {"anthropic", "mock", "auto"}:
         mode = "anthropic"
     return Settings(
         llm_mode=mode,

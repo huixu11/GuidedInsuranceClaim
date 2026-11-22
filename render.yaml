@@ -2,11 +2,10 @@
 #
 #   Render Dashboard -> New -> Blueprint -> Connect this repository -> Deploy Blueprint
 #
-# It starts in offline mode (no model, no key, fixed replies), which is enough to click through
-# the whole workflow. To run the live model instead, open the service's Environment tab and set
-# SOP_LLM_MODE to "anthropic", then either
-#   - add ANTHROPIC_API_KEY as a secret there: everyone with the link uses that key, or
-#   - leave it out: each tester pastes their own key into the UI's Settings dialog.
+# SOP_LLM_MODE=auto: without a key the offline double answers (fixed replies, no model calls),
+# which is enough to click through the whole workflow; a tester who saves their own Anthropic API
+# key in the UI's Settings dialog gets the live model, with that key, for their own requests.
+# No key is stored on the server, so the hosted demo cannot spend anyone else's credit.
 # The README section "Hosted demo" has the details and the limits of the free plan.
 services:
   - type: web
@@ -18,7 +17,7 @@ services:
     autoDeployTrigger: commit
     envVars:
       - key: SOP_LLM_MODE
-        value: mock
+        value: auto
       # The image listens on this port (HOST is already 0.0.0.0 in the Dockerfile).
       - key: PORT
         value: "8000"

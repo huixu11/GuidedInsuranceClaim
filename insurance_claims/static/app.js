@@ -709,16 +709,7 @@
     dom.appName.title = name;
     document.title = name;
 
-    const models = obj(c.models);
-    const respond = str(models.respond);
-    const understand = str(models.understand);
-    if (c.llm_mode === 'mock') {
-      dom.appSub.textContent = 'SOP agent demo · offline mock model';
-      dom.appSub.title = 'The offline mock model is a deterministic test double. No model calls are made.';
-    } else {
-      dom.appSub.textContent = `SOP agent demo · live model${respond ? ` · ${respond}` : ''}`;
-      dom.appSub.title = `Replies: ${respond || 'not set'} · structured calls: ${understand || 'not set'}`;
-    }
+    updateModelLine();
 
     const today = str(c.demo_today);
     dom.settingsClock.textContent = today ? `The agent reasons as if today were ${today}.` : '';
@@ -915,12 +906,48 @@
 
   /* ================================================================ settings */
 
+  // Which model answers this tab's next message: 'offline' or 'live'. In "auto" mode the server
+  // uses the live model when a key is available (this tab's or its own), else the offline mock.
+  function modelInUse() {
+    const c = app.config;
+    if (c.llm_mode === 'mock') return 'offline';
+    if (c.llm_mode === 'auto' && !c.has_server_key && !getApiKey()) return 'offline';
+    return 'live';
+  }
+
+  // The header's subtitle says which model is answering.
+  function updateModelLine() {
+    const c = app.config;
+    const models = obj(c.models);
+    const respond = str(models.respond);
+    const understand = str(models.understand);
+    if (modelInUse() === 'offline') {
+      dom.appSub.textContent = 'SOP agent demo · offline mock model';
+      dom.appSub.title = c.llm_mode === 'auto'
+        ? 'No API key in this tab, so the offline mock model answers. Add a key in Settings to use the live model.'
+        : 'The offline mock model is a deterministic test double. No model calls are made.';
+    } else {
+      dom.appSub.textContent = `SOP agent demo · live model${respond ? ` · ${respond}` : ''}`;
+      dom.appSub.title = `Replies: ${respond || 'not set'} · structured calls: ${understand || 'not set'}`;
+    }
+  }
+
+  // Saving or clearing the key in "auto" mode switches the model mid-conversation: say so.
+  function noteModelSwitch(before) {
+    const now = modelInUse();
+    updateModelLine();
+    if (now === before || !app.sessionId) return;
+    appendDivider(now === 'live' ? 'Live model from here on' : 'Offline mock model from here on', false);
+    scrollChatToBottom();
+  }
+
   // Whether the API key needs the user: 'missing' (a live model with no key anywhere),
   // 'rejected' (the key sent was refused) or ''.
   function keyAttention() {
     const c = app.config;
     if (c.llm_mode === 'mock') return '';
     if (app.keyError === 'invalid_api_key') return 'rejected';
+    if (c.llm_mode === 'auto') return ''; // no key is fine there: the offline mock answers
     if (app.keyError === 'missing_api_key') return 'missing';
     if (app.configLoaded && !c.has_server_key && !getApiKey()) return 'missing';
     return '';
@@ -929,14 +956,17 @@
   // The header's Settings button turns into "Add API key" (with a dot) when a key is needed.
   function updateSettingsButton() {
     const attention = keyAttention();
+    // In "auto" mode a key is an invitation, not a requirement: same label, no warning dot.
+    const optional = !attention && app.configLoaded && app.config.llm_mode === 'auto'
+      && modelInUse() === 'offline';
     let label = 'Settings';
     if (attention === 'rejected' && getApiKey()) label = 'Check API key';
-    else if (attention) label = 'Add API key';
+    else if (attention || optional) label = 'Add API key';
     dom.btnSettingsText.textContent = label;
     dom.btnSettings.setAttribute('aria-label', label);
-    dom.btnSettings.title = attention
-      ? 'The model API key is needed: open the settings to add it'
-      : 'Model API key, consent scenario and demo clock';
+    if (attention) dom.btnSettings.title = 'The model API key is needed: open the settings to add it';
+    else if (optional) dom.btnSettings.title = 'Add your API key to switch this tab from the offline mock model to the live model';
+    else dom.btnSettings.title = 'Model API key, consent scenario and demo clock';
     dom.btnSettings.classList.toggle('needs-key', Boolean(attention));
     dom.settingsDot.hidden = !attention;
   }
@@ -968,6 +998,12 @@
     if (c.llm_mode === 'mock') return 'This server runs the offline mock model, so no key is needed.';
     const model = str(obj(c.models).respond);
     const live = `This server runs the live model${model ? ` (${model})` : ''}`;
+    if (c.llm_mode === 'auto' && !c.has_server_key) {
+      const named = `the live model${model ? ` (${model})` : ''}`;
+      return getApiKey()
+        ? `This tab uses ${named} with the key saved below. Clear the key to go back to the offline mock model.`
+        : `Without a key this server answers with the offline mock model. Save your Anthropic API key below and this tab uses ${named} instead.`;
+    }
     if (c.has_server_key) {
       return `${live} and already has a key, so yours is optional. A key saved here is used instead of the server's for your requests.`;
     }
@@ -1006,24 +1042,33 @@
       showKeyInputError('An API key is a single line of plain ASCII characters without spaces.');
       return;
     }
+    const before = modelInUse();
     setApiKey(value);
     app.keyError = '';
     dom.keyInput.value = '';
     updateSettingsButton();
     closeDialog(dom.settingsDialog);
-    announce('API key saved for this browser tab.');
+    noteModelSwitch(before);
+    announce(modelInUse() !== before
+      ? 'API key saved. This tab now uses the live model.'
+      : 'API key saved for this browser tab.');
     if (app.failed && app.failed.retryBtn && app.failed.retryBtn.isConnected) {
       app.failed.retryBtn.focus({ preventScroll: true });
     }
   }
 
   function onKeyClear() {
+    const before = modelInUse();
     setApiKey('');
     app.keyError = '';
     dom.keyInput.value = '';
     updateSettingsButton();
     refreshSavedKeyNote();
-    announce('Browser API key cleared.');
+    dom.keyMode.textContent = keyModeNote();
+    noteModelSwitch(before);
+    announce(modelInUse() !== before
+      ? 'Browser API key cleared. This tab is back on the offline mock model.'
+      : 'Browser API key cleared.');
     dom.keyInput.focus();
   }
 
