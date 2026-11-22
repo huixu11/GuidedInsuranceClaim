@@ -58,8 +58,12 @@ docker run --rm -p 8000:8000 -e SOP_LLM_MODE=mock sop-agent
 `render.yaml` is a [Render](https://render.com) Blueprint that builds the same Dockerfile and
 serves it at a fixed `https://<name>.onrender.com` address, on the free plan:
 
-1. Sign in to Render with GitHub and give it access to this repository.
-2. **New → Blueprint**, pick the repository, **Apply**. The first build takes a few minutes.
+1. Sign in to Render with GitHub. When GitHub asks which repositories the Render app may access,
+   *Only select repositories* with this one is enough (it can be changed later at
+   <https://github.com/apps/render/installations/new>).
+2. In the Render Dashboard choose **New → Blueprint**, click **Connect** next to this repository,
+   keep the `main` branch, review the one web service it lists and click **Deploy Blueprint**. The
+   first build takes a few minutes.
 
 It starts in offline mode, so the whole workflow can be clicked through without a key. To run the
 live model, open the service's **Environment** tab and set `SOP_LLM_MODE` to `anthropic`, then

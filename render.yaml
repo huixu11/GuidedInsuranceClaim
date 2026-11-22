@@ -1,6 +1,6 @@
 # Render Blueprint: a hosted copy of the demo, built from the Dockerfile in this repository.
 #
-#   render.com -> New -> Blueprint -> pick this repository -> Apply
+#   Render Dashboard -> New -> Blueprint -> Connect this repository -> Deploy Blueprint
 #
 # It starts in offline mode (no model, no key, fixed replies), which is enough to click through
 # the whole workflow. To run the live model instead, open the service's Environment tab and set
