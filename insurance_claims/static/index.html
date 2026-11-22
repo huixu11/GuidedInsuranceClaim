@@ -59,6 +59,8 @@
               <textarea id="composer-input" rows="1" placeholder="Waiting for the conversation to start…" aria-describedby="composer-hint" disabled></textarea>
               <button type="submit" class="send-btn" id="btn-send" aria-label="Send" disabled><span data-icon="send"></span></button>
             </form>
+            <!-- Shown only when the server is in "auto" mode: which model answers, and the way to switch. -->
+            <p class="model-note" id="model-note" hidden><span id="model-note-text"></span> <button type="button" class="link-btn" id="model-note-btn"></button></p>
             <p class="visually-hidden" id="composer-hint">Enter sends, Shift+Enter starts a new line. A suggested reply fills the message box, so you can edit it before sending.</p>
           </div>
         </div>

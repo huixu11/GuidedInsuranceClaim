@@ -1007,6 +1007,18 @@ details[open] > summary > .chev {
   opacity: 0.5;
 }
 
+.model-note {
+  margin: 8px 4px 0;
+  color: var(--text-3);
+  font-size: 12.5px;
+  line-height: 1.45;
+}
+
+.model-note .link-btn {
+  display: inline;
+  font-size: inherit;
+}
+
 .samples-more {
   flex: none;
   height: 32px;

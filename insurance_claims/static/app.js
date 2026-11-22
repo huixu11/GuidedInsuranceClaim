@@ -561,6 +561,9 @@
       composer: 'composer',
       input: 'composer-input',
       btnSend: 'btn-send',
+      modelNote: 'model-note',
+      modelNoteText: 'model-note-text',
+      modelNoteBtn: 'model-note-btn',
       inspector: 'inspector',
       viewOverview: 'ipanel-overview',
       viewTrace: 'ipanel-trace',
@@ -595,6 +598,7 @@
       startSession();
     });
     dom.btnSettings.addEventListener('click', () => openSettings());
+    dom.modelNoteBtn.addEventListener('click', () => openSettings());
     dom.btnFixtures.addEventListener('click', openFixtures);
     dom.consentSelect.addEventListener('change', () => {
       announce(`Consent scenario ${dom.consentSelect.value} will be used for the next new conversation.`);
@@ -929,6 +933,17 @@
     } else {
       dom.appSub.textContent = `SOP agent demo · live model${respond ? ` · ${respond}` : ''}`;
       dom.appSub.title = `Replies: ${respond || 'not set'} · structured calls: ${understand || 'not set'}`;
+    }
+
+    // Under the message box, where it is seen on a phone too (the subtitle is hidden there).
+    const byKey = app.configLoaded && c.llm_mode === 'auto' && !c.has_server_key;
+    dom.modelNote.hidden = !byKey;
+    if (byKey && modelInUse() === 'offline') {
+      dom.modelNoteText.textContent = 'Offline mock model, fixed replies.';
+      dom.modelNoteBtn.textContent = 'Add your API key for the live model';
+    } else if (byKey) {
+      dom.modelNoteText.textContent = `Live model${respond ? ` (${respond})` : ''} with your API key.`;
+      dom.modelNoteBtn.textContent = 'Change or clear it';
     }
   }
 
