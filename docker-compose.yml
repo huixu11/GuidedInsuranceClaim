@@ -1,0 +1,16 @@
+services:
+  sop-agent:
+    build: .
+    image: sop-agent
+    ports:
+      - "${PORT:-8000}:8000"
+    environment:
+      # Model API auth token. Leave empty to have testers paste a key in the UI instead.
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      SOP_LLM_MODE: ${SOP_LLM_MODE:-anthropic}
+      SOP_MODEL: ${SOP_MODEL:-claude-opus-5-5}
+      SOP_MODEL_UNDERSTAND: ${SOP_MODEL_UNDERSTAND:-claude-haiku-5-5}
+      SOP_EFFORT: ${SOP_EFFORT:-low}
+      SOP_EFFORT_UNDERSTAND: ${SOP_EFFORT_UNDERSTAND:-low}
+      SOP_TODAY: ${SOP_TODAY:-2026-03-02}
+      SOP_EXPOSE_FIXTURES: ${SOP_EXPOSE_FIXTURES:-1}

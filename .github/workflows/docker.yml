@@ -1,0 +1,103 @@
+name: docker
+
+# Builds the image exactly as the README describes, runs it, and walks the demo test case
+# through all four SOP phases over HTTP. No model API key is needed: the container is run in
+# offline mode (SOP_LLM_MODE=mock) and, separately, in model mode with no key at all.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  image:
+    name: Build the image and run it
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Build the image
+        run: docker build -t sop-agent .
+
+      - name: Image contents
+        run: |
+          docker image inspect sop-agent --format 'size: {{.Size}} bytes | user: {{.Config.User}}'
+          docker run --rm sop-agent python --version
+          docker run --rm sop-agent pip list --format=freeze --disable-pip-version-check
+          # Only the application and its requirements file belong in the image:
+          # no tests, no scripts, no .env.
+          docker run --rm sop-agent ls -A /app
+          test "$(docker run --rm sop-agent ls -A /app | sort | tr '\n' ' ')" = "insurance_claims requirements.txt "
+
+      - name: Start a container in offline mode
+        run: docker run -d --name sop-offline -p 8000:8000 -e SOP_LLM_MODE=mock sop-agent
+
+      - name: Wait for the image's own HEALTHCHECK to report healthy
+        run: |
+          for i in $(seq 1 40); do
+            status=$(docker inspect --format '{{.State.Health.Status}}' sop-offline)
+            echo "$(date +%T) health: $status"
+            if [ "$status" = "healthy" ]; then exit 0; fi
+            if [ "$status" = "unhealthy" ]; then break; fi
+            sleep 3
+          done
+          docker logs sop-offline
+          exit 1
+
+      - name: Runs as the non-root user
+        run: |
+          docker exec sop-offline id
+          test "$(docker exec sop-offline id -un)" = "appuser"
+          test "$(docker exec sop-offline id -u)" = "10001"
+
+      - name: Demo test case through the published port
+        run: python3 scripts/docker_smoke.py http://127.0.0.1:8000
+
+      - name: Start a container in model mode without a key
+        run: |
+          docker run -d --name sop-nokey -p 8001:8000 sop-agent
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8001/healthz > /dev/null 2>&1; then exit 0; fi
+            sleep 1
+          done
+          docker logs sop-nokey
+          exit 1
+
+      - name: A missing key is reported cleanly
+        run: python3 scripts/docker_smoke.py http://127.0.0.1:8001 --no-key
+
+      - name: docker compose builds, starts and serves the same workflow
+        env:
+          SOP_LLM_MODE: mock
+          PORT: "8002"
+        run: |
+          docker compose up --build -d
+          for i in $(seq 1 30); do
+            if curl -fsS http://127.0.0.1:8002/healthz > /dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          python3 scripts/docker_smoke.py http://127.0.0.1:8002
+          docker compose down
+
+      - name: Container logs
+        if: always()
+        run: |
+          echo "--- offline mode ---"; docker logs sop-offline || true
+          echo "--- model mode, no key ---"; docker logs sop-nokey || true
+
+  tests:
+    name: Test suite on the image's Python
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: pytest inside python:3.14-slim
+        run: |
+          docker run --rm -v "$PWD":/src -w /src -e PYTHONDONTWRITEBYTECODE=1 python:3.14-slim \
+            sh -c "pip install --no-cache-dir --quiet --root-user-action=ignore -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider"
