@@ -3,9 +3,11 @@
     python scripts/spec_check.py http://127.0.0.1:8000        # one PASS/FAIL line per requirement
     python scripts/spec_check.py http://127.0.0.1:8000 -v     # also print the replies it judged
 
-Standard library only. It reads the session state the API returns and matches a few words of the
-offline (mock) replies, so run it against `SOP_LLM_MODE=mock`; the live model words its replies
-differently. Exits non-zero if any requirement fails.
+Standard library only. Each check reads the session state the API returns (phase, matched fields,
+memory, selected claim, outbox, strikes) and, where the requirement is about what the agent says,
+looks for a few loose words in the reply. It is meant for an offline instance (`SOP_LLM_MODE=mock`),
+where the replies are fixed. Against the live model it costs about 45 turns of API credit and the
+wording varies, so read a FAIL there with -v before believing it. Exits non-zero if any check fails.
 """
 from __future__ import annotations
 
@@ -19,6 +21,11 @@ VERBOSE = "-v" in sys.argv
 DEMO = ("I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm calling about my denied healthcare "
         "claim from January. DOB is 1985-03-15, SSN last four is 4472.")
 CLAIM_DETAIL = re.compile(r"CL-\d+|pathology|office note|appeal deadline|March 18|was denied because", re.I)
+# Loose word lists: the offline replies are fixed, the live model's are not.
+EMPATHY = re.compile(r"sorry|apolog|understand|frustrat|hear you|stressful|upsetting", re.I)
+WHY_VERIFY = re.compile(r"protect|privacy|private|secur|safe|personal|confidential|authori[sz]|no one else", re.I)
+ID_OPTIONS = re.compile(r"name|date of birth|phone|email|SSN", re.I)
+SUBMISSION = re.compile(r"pathology|portal|upload|fax|mail", re.I)
 results: list[tuple[str, bool, str]] = []
 
 
@@ -26,7 +33,7 @@ def call(path: str, body: dict | None = None) -> dict:
     req = urllib.request.Request(BASE + path, data=None if body is None else json.dumps(body).encode(),
                                  method="GET" if body is None else "POST",
                                  headers={"Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=30) as r:
+    with urllib.request.urlopen(req, timeout=120) as r:
         return json.loads(r.read())
 
 
@@ -82,7 +89,7 @@ check("Refusal: stays in VERIFY_ID and offers other fields", c.phase == "VERIFY_
 
 c = Convo().say("Why do you need my personal information?")
 check("Clarification question is answered without advancing", c.phase == "VERIFY_ID" and not leaks(c.reply)
-      and bool(re.search(r"protect|privacy|verify|security", c.reply, re.I)))
+      and bool(WHY_VERIFY.search(c.reply)))
 
 # 2. Memory across phases ------------------------------------------------------------------
 c = Convo().say("I'm calling about my denied healthcare claim from January.")
@@ -104,7 +111,7 @@ check("Demo case: phases run in order VERIFY_ID > RESOLVE_INTENT > PROCESS_CASE"
 check("Demo case: claim CL-2048 resolved from the remembered hint", c.state["case"]["selected_case_id"] == "CL-2048"
       and "CL-2048" in c.reply)
 c.say("How do I submit the missing documents?")
-check("PROCESS_CASE: grounded follow-up answer", c.phase == "PROCESS_CASE" and bool(re.search(r"pathology", c.reply, re.I)))
+check("PROCESS_CASE: grounded follow-up answer", c.phase == "PROCESS_CASE" and bool(SUBMISSION.search(c.reply)))
 c.say("What is RL?")
 check("Out-of-scope question is declined politely, phase unchanged", c.phase == "PROCESS_CASE"
       and c.state["guardrails"]["out_of_scope"]["consecutive"] == 1
@@ -140,10 +147,10 @@ check("Repeated out-of-scope questions lead to a human-representative offer",
 c = Convo().say("I already told you who I am. This is ridiculous. Just tell me why my claim was denied.")
 emo = c.state["guardrails"]["emotion"]
 check("Frustrated caller: acknowledged, gate explained, nothing disclosed", c.phase == "VERIFY_ID" and not leaks(c.reply)
-      and emo["label"] != "neutral" and bool(re.search(r"sorry|understand|frustrat", c.reply, re.I))
-      and bool(re.search(r"protect|verify|privacy", c.reply, re.I)), f"emotion={emo['label']}/{emo['intensity']}")
+      and emo["label"] != "neutral" and bool(EMPATHY.search(c.reply))
+      and bool(WHY_VERIFY.search(c.reply)), f"emotion={emo['label']}/{emo['intensity']}")
 check("Frustrated caller: allowed verification options are offered",
-      bool(re.search(r"name|date of birth|phone|email|SSN", c.reply, re.I)))
+      bool(ID_OPTIONS.search(c.reply)))
 c = Convo().say("I want to talk to a human representative.")
 check("Asking for a human is honoured without bypassing the gate", not leaks(c.reply)
       and (c.state["escalation"] is not None or c.state["guardrails"]["human_offer_pending"]

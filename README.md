@@ -351,7 +351,9 @@ docker rm -f sop-test
 instance (`--mock`) and prints a PASS/FAIL line for each: no claim details before verification,
 two fields are not enough, partial answers add up, alternate fields, refusals, the hint remembered
 during `VERIFY_ID` and used afterwards, the demo case end to end, grounded answers, send and skip
-for the summary email, off-topic questions and the human offer, the frustrated caller.
+for the summary email, off-topic questions and the human offer, the frustrated caller. It can also be
+pointed at an instance running the live model (about 45 turns of API credit); the wording varies
+there, so read a FAIL with `-v` before believing it.
 
 ## Project layout
 
