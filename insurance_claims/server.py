@@ -42,9 +42,13 @@ agent = Agent(repo, settings)
 #               conversation is completed; a follow-up re-opens it). Suggestions without it
 #               are for the phase's other turns, and are also shown at a point that has no
 #               suggestions of its own. Nothing is suggested once a call is escalated.
+# The order is the display order. The UI's suggestion row shows the marked next step and then
+# the first three other suggestions for that point, in list order; every suggestion is listed
+# by phase under "More". So the detours that matter most at each point come first.
 # After VERIFY_ID the texts name no one, so they suit any of the fixture callers.
 SAMPLE_PROMPTS: list[dict[str, Any]] = [
-    # -- VERIFY_ID ----------------------------------------------------------------------
+    # -- in the suggestion row ----------------------------------------------------------
+    # VERIFY_ID: the demo, then a frustrated caller, a partial answer and an off-topic question.
     {
         "label": "Demo test case",
         "text": (
@@ -55,36 +59,13 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         "happy_path": True,
     },
     {
-        "label": "Intent before ID",
-        "text": "Hi, I'm calling about my denied healthcare claim from January.",
-        "phases": ["VERIFY_ID"],
-    },
-    {
-        "label": "Partial ID",
-        "text": "My name is Margaret Chen and my date of birth is March 15, 1985.",
-        "phases": ["VERIFY_ID"],
-    },
-    {
-        "label": "Phone + email",
-        "text": "My phone is 650-521-2836 and my email is margaret@email.com.",
-        "phases": ["VERIFY_ID"],
-    },
-    {
-        "label": "Won't share SSN",
-        "text": "I'm Margaret Chen, but I'm not comfortable giving my SSN. Is there something else I can use?",
-        "phases": ["VERIFY_ID"],
-    },
-    {
         "label": "Frustrated caller",
         "text": "I already told you who I am. This is ridiculous. Just tell me why my claim was denied.",
         "phases": ["VERIFY_ID"],
     },
     {
-        "label": "Representative",
-        "text": (
-            "Hi, I'm David Chen, calling on behalf of my mother Margaret Chen about her denied claim. "
-            "Her date of birth is 1985-03-15 and her phone is 650-521-2836."
-        ),
+        "label": "Partial ID",
+        "text": "My name is Margaret Chen and my date of birth is March 15, 1985.",
         "phases": ["VERIFY_ID"],
     },
     {
@@ -94,14 +75,14 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         "when": ["consent"],
         "happy_path": True,
     },
-    # -- RESOLVE_INTENT -------------------------------------------------------------------
+    # RESOLVE_INTENT: name the claim, or go off topic, or ask for a human (both further down).
     {
         "label": "Name the claim",
         "text": "It's about the denied healthcare claim.",
         "phases": ["RESOLVE_INTENT"],
         "happy_path": True,
     },
-    # -- PROCESS_CASE ---------------------------------------------------------------------
+    # PROCESS_CASE: a documents question, then why it was denied, frustration, off topic.
     {
         "label": "Document follow-up",
         "text": "How do I submit the missing documents?",
@@ -110,7 +91,6 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         "then": "Wrap up",
     },
     {"label": "Why denied", "text": "Why was the claim denied?", "phases": ["PROCESS_CASE"]},
-    {"label": "Different claim", "text": "Can you also check on my auto claim?", "phases": ["PROCESS_CASE"]},
     {
         "label": "Frustrated caller",
         "text": (
@@ -119,8 +99,7 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         ),
         "phases": ["PROCESS_CASE"],
     },
-    {"label": "Wrap up", "text": "That's all I needed, thanks.", "phases": ["PROCESS_CASE"]},
-    # -- any phase before the wrap-up -------------------------------------------------------
+    # Any phase before the wrap-up.
     {
         "label": "Out of scope",
         "text": "What is RL?",
@@ -131,7 +110,7 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         "text": "I'd like to speak to a human representative, please.",
         "phases": ["VERIFY_ID", "RESOLVE_INTENT", "PROCESS_CASE"],
     },
-    # -- POST_PROCESS ---------------------------------------------------------------------
+    # POST_PROCESS: send or skip the summary, another address, one more question.
     {
         "label": "Send the summary",
         "text": "Yes, please send it.",
@@ -157,6 +136,33 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
         "phases": ["POST_PROCESS"],
         "when": ["email_offer", "wrapped_up"],
     },
+    # -- under "More" -------------------------------------------------------------------
+    {
+        "label": "Intent before ID",
+        "text": "Hi, I'm calling about my denied healthcare claim from January.",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Phone + email",
+        "text": "My phone is 650-521-2836 and my email is margaret@email.com.",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Won't share SSN",
+        "text": "I'm Margaret Chen, but I'm not comfortable giving my SSN. Is there something else I can use?",
+        "phases": ["VERIFY_ID"],
+    },
+    {
+        "label": "Representative",
+        "text": (
+            "Hi, I'm David Chen, calling on behalf of my mother Margaret Chen about her denied claim. "
+            "Her date of birth is 1985-03-15 and her phone is 650-521-2836."
+        ),
+        "phases": ["VERIFY_ID"],
+    },
+    {"label": "Different claim", "text": "Can you also check on my auto claim?", "phases": ["PROCESS_CASE"]},
+    # Marked as the next step once "Document follow-up" has been sent (its `then`).
+    {"label": "Wrap up", "text": "That's all I needed, thanks.", "phases": ["PROCESS_CASE"]},
 ]
 
 

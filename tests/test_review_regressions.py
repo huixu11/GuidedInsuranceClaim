@@ -482,6 +482,17 @@ def test_mock_extracts_last_four_from_a_full_ssn(agent):
     assert raw["identity"]["id_last4"] == "4472"
 
 
+def test_mock_keeps_the_intent_and_the_claim_hint_said_during_verification(agent):
+    """The brief's own example sentence: stay in VERIFY_ID, store the intent and the case hint."""
+    state = agent.new_session()
+    reply, _ = agent.handle_turn(state, "I'm calling about my denied healthcare claim from January.", MockBackend())
+    assert state.phase == Phase.VERIFY_ID and not state.verified
+    assert state.intent is not None and state.intent.value == "denial_question"
+    assert {k: v.value for k, v in state.hints.items()} == {
+        "case_type": "healthcare", "status": "denied", "time_reference": "January"}
+    assert "CL-" not in reply and "pathology" not in reply
+
+
 # ---------------------------------------------------------------------------
 # Found in live runs against the model
 # ---------------------------------------------------------------------------

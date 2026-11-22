@@ -58,6 +58,9 @@ jobs:
       - name: Demo test case through the published port
         run: python3 scripts/docker_smoke.py http://127.0.0.1:8000
 
+      - name: Every requirement of the brief, one by one
+        run: python3 scripts/spec_check.py http://127.0.0.1:8000
+
       - name: Start a container in model mode without a key
         run: |
           docker run -d --name sop-nokey -p 8001:8000 sop-agent

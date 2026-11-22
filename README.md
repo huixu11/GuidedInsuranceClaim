@@ -11,7 +11,7 @@ verified, no policy or claim data is loaded into the model's context at all, the
 tools, and it cannot change the phase — so there is nothing for a persuasive or upset caller to
 talk it into.
 
-![The test UI mid-conversation: chat on the left, SOP inspector on the right](docs/ui-process-case.png)
+![The test UI mid-conversation: the chat under the four workflow steps, the SOP state on the right](docs/ui-process-case.png)
 
 ---
 
@@ -19,7 +19,7 @@ talk it into.
 
 You need an Anthropic API key (the "API auth token") for the model. It can be supplied in any of
 three ways: the `ANTHROPIC_API_KEY` environment variable, a `.env` file (copy `.env.example`),
-or pasted into the UI's **API key** dialog (kept in the browser tab, sent per request as an
+or pasted into the UI's **Settings** dialog (kept in the browser tab, sent per request as an
 `X-API-Key` header — convenient for a hosted demo where each tester brings a key).
 
 ### Docker
@@ -57,35 +57,41 @@ docker run --rm -p 8000:8000 -e SOP_LLM_MODE=mock sop-agent
 
 ## Using the test UI
 
-Left: the chat. Right: the **SOP inspector**, which shows what the harness is doing —
+The chat is on the left, with the four SOP phases as steps above it (done, current, still to
+come; after a handoff it stops at the phase where the call was transferred). On the right, the
+**SOP state** shows what the harness is doing, in three tabs:
 
-- **Workflow** — current phase, its freedom level (strict / guided / open) and the phase history.
-- **Identity verification** — which of the five identifiers matched, mismatches, failed attempts,
-  representative and consent status. Identifier *values* are never shown or logged.
-- **Memory** — what the caller has said so far, tagged with the phase and turn it was captured in.
-- **Case / Guardrails / Escalation / Email** — selected claim and workflow path, out-of-scope
-  strikes, emotion tracking, the handoff summary, and the outbox of "sent" emails.
-- **Turn trace** — for every turn: the structured reading, memory writes, gate decisions, tool
-  calls, phase transitions, the directive given to the model, model calls and guard results.
+- **Overview** — the current phase and how much freedom the agent has in it (strict / guided /
+  open); **identity**: which of the five identifiers matched, failed attempts, the caller's role,
+  representative and consent status (identifier *values* are never shown or logged); what the
+  agent **remembered**, with the turn it was captured in; the selected **claim** and workflow
+  path, locked until identity is verified; the **safeguards** (out-of-scope strikes, refusals,
+  caller mood, human handoff); and the **summary email**.
+- **Trace** — the phase history, then for every turn: the structured reading, memory writes, gate
+  decisions, tool calls, phase transitions, the directive given to the model, model calls and
+  guard results. *Turn N* and *Show in chat* scroll the chat to that turn.
+- **JSON** — the raw session state, with a copy button.
 
-The row of buttons at the top of the inspector jumps to a section; a dot marks the sections
-that changed in the latest turn.
+Values that changed in the latest turn are briefly highlighted. On a narrow screen the chat and
+the SOP state are two tabs, and a dot on **SOP state** says it has changed.
 
-**Suggested replies** above the message box change with the phase. The first one, marked with an
-arrow, carries the demo forward, so the whole workflow can be walked by clicking it and pressing
-Enter four times; the others are detours worth trying at that point (a frustrated caller, an
-off-topic question, a refusal, a request for a human). Clicking one fills the message box so it
-can be edited before sending. **All examples** lists every suggestion by phase.
+**Suggested replies** sit in one row above the message box and change with the phase. The first,
+marked with an arrow, carries the demo forward, so the whole workflow can be walked by clicking it
+and pressing Enter four times; the next few are the detours most worth trying at that point (a
+frustrated caller, a partial answer, an off-topic question, a request for a human). Clicking one
+fills the message box so it can be edited before sending. **More** lists every suggestion by phase.
 
 When the summary email is sent it appears in the chat under the agent's reply, as well as in the
-inspector's outbox. A conversation survives a page reload, and `?session=<id>` opens an existing
-one (sessions live in server memory, so a server restart starts fresh).
+Overview. A conversation survives a page reload, and `?session=<id>` opens an existing one
+(sessions live in server memory, so a server restart starts fresh).
 
 ![The last step: the summary email shown in the chat after the caller chose to send it](docs/ui-email-summary.png)
 
 **Test data** (top bar) lists the fixture identities and claims so you know what to type.
-**Consent scenario** selects how the simulated policyholder-consent service behaves for the next
-conversation (`default`: approved on the second check; `timeout`: never approved).
+**Settings** holds the model API key (when the server runs the live model and has no key of its
+own, the button reads **Add API key**), the **consent scenario** — how the simulated
+policyholder-consent service behaves for the next new conversation (`default`: approved on the
+second check; `timeout`: never approved) — and the date the demo clock is set to.
 
 ### A five-minute walkthrough
 
@@ -95,11 +101,11 @@ Start a new conversation for each block. Most of these messages are among the su
    > I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm calling about my denied
    > healthcare claim from January. DOB is 1985-03-15, SSN last four is 4472.
 
-   The trace shows `verify_identity → 3 of 3`, the hint (*denied / healthcare / January*) stored
-   during `VERIFY_ID`, the resolver selecting CL-2048 from it, and the reply picking up from
-   "you mentioned…" instead of asking what the call is about. Then ask *"How do I submit the
-   missing documents, and how long will the review take?"* (a tool call to the guidance data),
-   say *"That's all, thanks"* (email offer) and answer *send* or *skip*.
+   The **Trace** tab shows `verify_identity → 3 of 3`, the hint (*denied / healthcare /
+   January*) stored during `VERIFY_ID`, the resolver selecting CL-2048 from it, and the reply
+   picking up from "you mentioned…" instead of asking what the call is about. Then ask *"How do I
+   submit the missing documents, and how long will the review take?"* (a tool call to the
+   guidance data), say *"That's all, thanks"* (email offer) and answer *send* or *skip*.
 2. **Memory across phases** — say *"Hi, I'm calling about my denied healthcare claim from
    January."* first. The agent stays in `VERIFY_ID`, discloses nothing, and stores the hint. Give
    name + date of birth, then phone: on verification it goes straight to the right claim.
@@ -115,7 +121,7 @@ Start a new conversation for each block. Most of these messages are among the su
 6. **Representative** — *"I'm David Chen, calling on behalf of my mother Margaret Chen…"* with her
    date of birth and phone: identifiers match, David is an authorised representative on file, and
    a consent request goes to the policyholder; details unlock only when consent is approved. Try
-   it again with the `timeout` consent scenario.
+   it again with **Settings → Consent scenario** set to `timeout`.
 
 ---
 
@@ -327,7 +333,8 @@ human request) against the real model and prints each reply with the harness dec
 `.github/workflows/docker.yml` does this on a GitHub-hosted Linux runner on every push, with no
 model key: it builds the image, checks what is in it, starts it in offline mode, waits for the
 image's own `HEALTHCHECK`, confirms it runs as the non-root `appuser`, and plays the demo test
-case through all four phases over the published port. It then starts a second container in model
+case through all four phases over the published port, then checks the brief's requirements one by
+one (`scripts/spec_check.py`). It then starts a second container in model
 mode with no key (expects a clean `missing_api_key`), repeats the walk-through via
 `docker compose`, and runs the test suite inside `python:3.14-slim`.
 
@@ -336,8 +343,15 @@ The same walk-through by hand, against any running instance:
 ```bash
 docker run -d --name sop-test -p 8000:8000 -e SOP_LLM_MODE=mock sop-agent
 python scripts/docker_smoke.py http://127.0.0.1:8000
+python scripts/spec_check.py http://127.0.0.1:8000
 docker rm -f sop-test
 ```
+
+`scripts/spec_check.py` goes through the brief one requirement at a time against an offline
+instance (`--mock`) and prints a PASS/FAIL line for each: no claim details before verification,
+two fields are not enough, partial answers add up, alternate fields, refusals, the hint remembered
+during `VERIFY_ID` and used afterwards, the demo case end to end, grounded answers, send and skip
+for the summary email, off-topic questions and the human offer, the frustrated caller.
 
 ## Project layout
 
@@ -360,6 +374,7 @@ insurance_claims/
   static/              the test UI (plain HTML/CSS/JS, no build step)
 scripts/run_scenarios.py     scripted conversations against the live model (or offline)
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
+scripts/spec_check.py        the brief, requirement by requirement, against an offline instance
 .github/workflows/docker.yml image build + container checks + test suite on Linux
 tests/
 ```

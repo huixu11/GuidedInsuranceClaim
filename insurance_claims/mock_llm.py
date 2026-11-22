@@ -161,7 +161,8 @@ class MockBackend:
                 hints["time_reference"] = "last month"
 
         intent = "none"
-        if re.search(r"why.{0,40}(denied|rejected)|appeal|dispute|reason.{0,20}deni", low):
+        if re.search(r"why.{0,40}(denied|rejected)|appeal|dispute|reason.{0,20}deni"
+                     r"|\b(about|regarding)\b.{0,40}\b(denied|rejected|denial)\b", low):
             intent = "denial_question"
         elif re.search(r"document|paperwork|submit|upload|send in|pathology|office note|\bfax\b|portal", low):
             intent = "document_submission"
