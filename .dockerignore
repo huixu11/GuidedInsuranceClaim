@@ -12,3 +12,6 @@ scripts
 docs
 *.zip
 .claude
+**/*.db
+**/*.db-wal
+**/*.db-shm

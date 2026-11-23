@@ -1,34 +1,64 @@
-"""HTTP API + static test UI."""
+"""HTTP API + static test UI.
+
+Serving model (README, "Scaling and limits"): a turn waits for one of SOP_MAX_CONCURRENT_TURNS
+slots (briefly; then 503 server_busy with Retry-After), then runs on a worker thread of its own
+pool while it holds the conversation through the session store (another message for the same
+conversation waits briefly, then 409 conversation_busy). Everything else (health, config, stats,
+static files, reads) never needs a turn slot. Bodies over 16 KB are refused (413) before they
+are parsed, and an optional per-client rate limit answers 429. Every refusal uses the error
+envelope and leaves the conversation exactly as it was.
+"""
 
 from __future__ import annotations
 
-import copy
+import asyncio
 import hashlib
 import logging
+import math
+import os
+import re
+import statistics
 import threading
 import time
+from collections import OrderedDict, deque
+from contextlib import asynccontextmanager
 from typing import Any
 
+import anyio
+from anyio.lowlevel import RunVar
 from fastapi import FastAPI, Header, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from . import sop
-from .agent import Agent
-from .config import AGENT_NAME, APP_NAME, STATIC_DIR, load_settings, server_has_credentials
+from .agent import Agent, ConversationClosed
+from .config import AGENT_NAME, APP_NAME, STATIC_DIR, Settings, load_settings, server_has_credentials
 from .data import Repository
 from .llm import AnthropicBackend, LLMError
 from .mock_llm import MockBackend
-from .state import SessionState
+from .store import (
+    ConversationBusy,
+    SessionNotFound,
+    SessionStore,
+    StoreError,
+    StoreUnavailable,
+    open_store,
+)
 
 log = logging.getLogger("sop.server")
+turn_log = logging.getLogger("sop.turn")
 
 settings = load_settings()
 repo = Repository.load()
 agent = Agent(repo, settings)
+
+MAX_BODY_BYTES = 16 * 1024  # request bodies; a 4,000-character message is at most ~16,000 bytes of UTF-8
+MAX_MESSAGE_CHARS = 4000
+SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")  # ids are uuid4 hex; anything else cannot exist
 
 # Suggested caller messages for the test UI, tagged with where in the SOP they make sense.
 #   phases      The phases the suggestion fits.
@@ -167,37 +197,228 @@ SAMPLE_PROMPTS: list[dict[str, Any]] = [
 
 
 class ApiError(Exception):
-    def __init__(self, code: str, message: str, status: int) -> None:
+    def __init__(self, code: str, message: str, status: int, retry_after: int | None = None) -> None:
         super().__init__(message)
         self.code, self.message, self.status = code, message, status
+        self.retry_after = retry_after  # seconds, sent as Retry-After
 
 
-class SessionStore:
-    """In-memory sessions (a demo store; swap for Redis or a database in production)."""
+def error_response(
+    status: int, code: str, message: str, retry_after: int | None = None, headers: dict[str, str] | None = None
+) -> JSONResponse:
+    extra = dict(headers or {})
+    if retry_after is not None:
+        extra["Retry-After"] = str(max(1, int(retry_after)))
+    return JSONResponse({"error": {"code": code, "message": message}}, status_code=status, headers=extra)
 
-    def __init__(self, ttl_seconds: int) -> None:
-        self._ttl = ttl_seconds
+
+# ---------------------------------------------------------------------------
+# Serving machinery: turn slots, rate limit, counters
+# ---------------------------------------------------------------------------
+class _SlotWaiter:
+    __slots__ = ("loop", "future", "granted")
+
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+        self.future: asyncio.Future[None] = loop.create_future()
+        self.granted = False
+
+
+def _wake(future: asyncio.Future[None]) -> None:
+    if not future.done():
+        future.set_result(None)
+
+
+class TurnSlots:
+    """At most `size` turns at once. A turn waits for a slot without holding a thread, first come
+    first served, for a bounded time. Thread-safe and usable from any event loop (uvicorn runs
+    one per process; the test client runs one per request)."""
+
+    def __init__(self, size: int) -> None:
+        self.size = max(1, int(size))
         self._lock = threading.Lock()
-        self._sessions: dict[str, tuple[float, SessionState, threading.Lock]] = {}
+        self._used = 0
+        self._waiters: deque[_SlotWaiter] = deque()
 
-    def put(self, state: SessionState) -> None:
+    @property
+    def in_use(self) -> int:
+        return self._used
+
+    @property
+    def waiting(self) -> int:
+        return len(self._waiters)
+
+    async def acquire(self, timeout: float) -> bool:
+        loop = asyncio.get_running_loop()
         with self._lock:
-            now = time.time()
-            for sid in [s for s, (t, _, _) in self._sessions.items() if now - t > self._ttl]:
-                del self._sessions[sid]
-            existing = self._sessions.get(state.session_id)
-            lock = existing[2] if existing else threading.Lock()
-            self._sessions[state.session_id] = (now, state, lock)
+            if self._used < self.size and not self._waiters:
+                self._used += 1
+                return True
+            if timeout <= 0:
+                return False
+            waiter = _SlotWaiter(loop)
+            self._waiters.append(waiter)
+        try:
+            await asyncio.wait_for(waiter.future, timeout)
+            return True
+        except TimeoutError:
+            with self._lock:
+                if waiter.granted:  # handed over just as the wait ran out: keep it
+                    return True
+                self._waiters.remove(waiter)
+            return False
+        except BaseException:  # cancelled while waiting
+            with self._lock:
+                granted = waiter.granted
+                if not granted:
+                    self._waiters.remove(waiter)
+            if granted:
+                self.release()
+            raise
 
-    def get(self, session_id: str) -> tuple[SessionState, threading.Lock]:
+    def release(self) -> None:
         with self._lock:
-            entry = self._sessions.get(session_id)
-        if entry is None:
-            raise ApiError("session_not_found", "This conversation no longer exists on the server.", 404)
-        return entry[1], entry[2]
+            while self._waiters:
+                waiter = self._waiters.popleft()
+                try:
+                    waiter.loop.call_soon_threadsafe(_wake, waiter.future)
+                except RuntimeError:  # its event loop is gone; so is the waiter
+                    continue
+                waiter.granted = True  # the slot passes straight to the longest waiter
+                return
+            self._used -= 1
 
 
-store = SessionStore(settings.session_ttl_seconds)
+class RateLimiter:
+    """Token buckets per client and kind: `per_minute` turns, and a quarter of that (at least
+    one) for new conversations. In memory, so with several workers or instances each keeps its
+    own buckets; a gateway in front is the place for a global limit."""
+
+    MAX_CLIENTS = 10_000  # buckets kept; the least recently seen client is forgotten first
+
+    def __init__(self, per_minute: int) -> None:
+        self.budgets = {"turn": float(per_minute), "create": float(max(1, per_minute // 4))}
+        self._lock = threading.Lock()
+        self._buckets: OrderedDict[tuple[str, str], list[float]] = OrderedDict()
+
+    def take(self, client: str, kind: str, now: float | None = None) -> float:
+        """0.0 if the request may go ahead, else the seconds until it could."""
+        capacity = self.budgets[kind]
+        rate = capacity / 60.0
+        now = time.monotonic() if now is None else now
+        key = (kind, client)
+        with self._lock:
+            bucket = self._buckets.get(key)
+            if bucket is None:
+                bucket = self._buckets[key] = [capacity, now]
+                if len(self._buckets) > self.MAX_CLIENTS:
+                    self._buckets.popitem(last=False)
+            else:
+                self._buckets.move_to_end(key)
+                bucket[0] = min(capacity, bucket[0] + (now - bucket[1]) * rate)
+                bucket[1] = now
+            if bucket[0] >= 1.0:
+                bucket[0] -= 1.0
+                return 0.0
+            return (1.0 - bucket[0]) / rate
+
+
+COUNTERS = (
+    "conversations_created",
+    "turns_answered",
+    "refused_busy_503",
+    "conflicts_409",
+    "rate_limited_429",
+    "too_large_413",
+    "model_errors",
+    "closed_at_message_limit_409",
+)
+
+
+class Stats:
+    """Counters since start and the latency of the last 1,000 answered turns (thread-safe)."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._counts = dict.fromkeys(COUNTERS, 0)
+        self._latency: deque[float] = deque(maxlen=1000)
+        self.started = time.monotonic()
+
+    def count(self, name: str) -> None:
+        with self._lock:
+            self._counts[name] += 1
+
+    def turn_answered(self, seconds: float) -> None:
+        with self._lock:
+            self._counts["turns_answered"] += 1
+            self._latency.append(seconds)
+
+    def counts(self) -> dict[str, int]:
+        with self._lock:
+            return dict(self._counts)
+
+    def latency(self) -> dict[str, Any]:
+        with self._lock:
+            window = sorted(self._latency)
+        if not window:
+            return {"turns": 0, "median_ms": None, "p95_ms": None}
+        return {
+            "turns": len(window),
+            "median_ms": round(statistics.median(window) * 1000, 1),
+            "p95_ms": round(window[max(0, math.ceil(0.95 * len(window)) - 1)] * 1000, 1),
+        }
+
+    def retry_after(self) -> int:
+        """About one turn's time: when a busy server is likely to have a free slot again."""
+        with self._lock:
+            window = list(self._latency)
+        if not window:
+            return 1
+        return max(1, min(30, math.ceil(statistics.median(window))))
+
+
+class Runtime:
+    """What serving needs besides the engine: the store, the turn slots, the rate limiter and
+    the counters. Built once per process from the settings; tests swap in their own."""
+
+    def __init__(self, cfg: Settings, store: SessionStore | None = None) -> None:
+        self.settings = cfg
+        self.store = store if store is not None else open_store(cfg)
+        self.slots = TurnSlots(cfg.max_concurrent_turns)
+        self.limiter = RateLimiter(cfg.rate_limit_per_minute) if cfg.rate_limit_per_minute > 0 else None
+        self.stats = Stats()
+
+    def describe(self) -> str:
+        budget = getattr(self.store, "max_bytes", 0)
+        return (
+            f"{self.store.kind} session store"
+            + (" (shared)" if self.store.shared else " (this process only)")
+            + f", {self.slots.size} turn slots, at most {self.settings.max_turns_per_conversation} "
+            f"messages per conversation, {self.store.max_sessions} conversations"
+            + (f" or {budget // (1024 * 1024)} MB of state" if budget else "")
+            + ", rate limit "
+            + (f"{self.settings.rate_limit_per_minute}/min per client" if self.limiter else "off")
+        )
+
+
+runtime = Runtime(settings)
+
+# Turns run on worker threads of their own, sized to the turn slots, so they can never use up
+# the default pool that serves reads, session creation and static files (one per event loop).
+_turn_threads: RunVar[anyio.CapacityLimiter] = RunVar("sop_turn_threads")
+
+
+def _turn_thread_limiter(size: int) -> anyio.CapacityLimiter:
+    try:
+        limiter = _turn_threads.get()
+    except LookupError:
+        limiter = anyio.CapacityLimiter(size)
+        _turn_threads.set(limiter)
+    if limiter.total_tokens != size:
+        limiter.total_tokens = size
+    return limiter
+
+
 _backends: dict[str, Any] = {}
 _backends_lock = threading.Lock()
 
@@ -216,7 +437,10 @@ def get_backend(api_key: str | None) -> Any:
     )
     if offline:
         with _backends_lock:
-            return _backends.setdefault("mock", MockBackend())
+            backend = _backends.get("mock")
+            if backend is None:
+                backend = _backends["mock"] = MockBackend(settings.mock_latency_ms)
+            return backend
     cache_key = "server" if key is None else hashlib.sha256(key.encode()).hexdigest()
     with _backends_lock:
         backend = _backends.get(cache_key)
@@ -231,28 +455,94 @@ def get_backend(api_key: str | None) -> Any:
         return backend
 
 
-app = FastAPI(title=APP_NAME, docs_url="/api/docs", redoc_url=None)
+# ---------------------------------------------------------------------------
+# App, request-size limit and error envelope
+# ---------------------------------------------------------------------------
+class PayloadTooLarge(StarletteHTTPException):
+    def __init__(self) -> None:
+        super().__init__(413, f"The request body is larger than {MAX_BODY_BYTES // 1024} KB.")
+
+
+class BodySizeLimit:
+    """Refuses request bodies over `max_bytes` with 413 before anything parses them: at once by
+    the declared Content-Length, and by counting the bytes as they arrive (a chunked body
+    declares no length)."""
+
+    def __init__(self, app: ASGIApp, max_bytes: int) -> None:
+        self.app = app
+        self.max_bytes = max_bytes
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        declared: int | None = None
+        for name, value in scope.get("headers") or []:
+            if name == b"content-length":
+                try:
+                    declared = int(value)
+                except ValueError:
+                    declared = -1
+        if declared is not None and (declared < 0 or declared > self.max_bytes):
+            if declared < 0:
+                response = error_response(400, "bad_request", "The Content-Length header is not valid.")
+            else:
+                runtime.stats.count("too_large_413")
+                response = error_response(413, "payload_too_large", PayloadTooLarge().detail)
+            await response(scope, receive, send)
+            return
+        received = 0
+
+        async def limited_receive() -> Message:
+            nonlocal received
+            message = await receive()
+            if message["type"] == "http.request":
+                received += len(message.get("body", b""))
+                if received > self.max_bytes:
+                    raise PayloadTooLarge()  # FastAPI passes HTTP exceptions through to the handler
+            return message
+
+        await self.app(scope, limited_receive, send)
+
+
+@asynccontextmanager
+async def _lifespan(_: FastAPI) -> Any:
+    log.info("serving with %s", runtime.describe())
+    yield
+    runtime.store.close()
+
+
+app = FastAPI(title=APP_NAME, docs_url="/api/docs", redoc_url=None, lifespan=_lifespan)
+app.add_middleware(BodySizeLimit, max_bytes=MAX_BODY_BYTES)
 
 
 @app.exception_handler(ApiError)
 async def _api_error(_: Request, exc: ApiError) -> JSONResponse:
-    return JSONResponse({"error": {"code": exc.code, "message": exc.message}}, status_code=exc.status)
+    return error_response(exc.status, exc.code, exc.message, exc.retry_after)
+
+
+_HTTP_CODES = {400: "bad_request", 404: "not_found", 405: "method_not_allowed", 413: "payload_too_large"}
 
 
 @app.exception_handler(StarletteHTTPException)
 async def _http_error(_: Request, exc: StarletteHTTPException) -> JSONResponse:
-    """Unknown routes and methods use the same error envelope as everything else."""
-    code = {404: "not_found", 405: "method_not_allowed"}.get(exc.status_code, "bad_request")
-    return JSONResponse(
-        {"error": {"code": code, "message": str(exc.detail)}}, status_code=exc.status_code
-    )
+    """Unknown routes and methods, and bodies found too large while reading them, use the same
+    error envelope as everything else."""
+    if exc.status_code == 413:
+        runtime.stats.count("too_large_413")
+    code = _HTTP_CODES.get(exc.status_code, "bad_request")
+    return error_response(exc.status_code, code, str(exc.detail), headers=exc.headers)
 
 
 @app.exception_handler(RequestValidationError)
 async def _validation_error(_: Request, exc: RequestValidationError) -> JSONResponse:
-    return JSONResponse(
-        {"error": {"code": "bad_request", "message": "The request body is not valid."}}, status_code=400
-    )
+    return error_response(400, "bad_request", "The request body is not valid.")
+
+
+@app.exception_handler(Exception)
+async def _unexpected_error(_: Request, exc: Exception) -> JSONResponse:
+    log.error("unhandled error", exc_info=exc)
+    return error_response(500, "internal_error", "Something went wrong on the server.")
 
 
 class NewSession(BaseModel):
@@ -260,16 +550,49 @@ class NewSession(BaseModel):
 
 
 class NewMessage(BaseModel):
-    text: str = Field(min_length=1, max_length=4000)
+    text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+
+
+def _client_of(request: Request) -> str:
+    """Who a rate limit applies to: the socket peer, or with SOP_TRUST_PROXY=1 the last hop of
+    X-Forwarded-For (the address our own proxy saw; earlier hops are whatever the client sent)."""
+    if runtime.settings.trust_proxy:
+        hops = [h.strip() for h in ",".join(request.headers.getlist("x-forwarded-for")).split(",")]
+        hops = [h for h in hops if h]
+        if hops:
+            return hops[-1][:100]
+    return request.client.host if request.client else "unknown"
+
+
+def _rate_limit(request: Request, kind: str) -> None:
+    limiter = runtime.limiter
+    if limiter is None:
+        return
+    wait = limiter.take(_client_of(request), kind)
+    if wait > 0:
+        runtime.stats.count("rate_limited_429")
+        what = "messages" if kind == "turn" else "new conversations"
+        raise ApiError("rate_limited", f"Too many {what} from this client; please wait a moment.", 429,
+                       retry_after=math.ceil(wait))
+
+
+def _check_session_id(session_id: str) -> None:
+    if not SESSION_ID.fullmatch(session_id):
+        raise ApiError("session_not_found", "This conversation no longer exists on the server.", 404)
+
+
+def _store_unavailable() -> ApiError:
+    runtime.stats.count("refused_busy_503")
+    return ApiError("server_busy", "The session store is busy; please try again in a moment.", 503, retry_after=1)
 
 
 @app.get("/healthz")
-def healthz() -> dict[str, str]:
+async def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/api/config")
-def get_config() -> dict[str, Any]:
+async def get_config() -> dict[str, Any]:
     return {
         "app_name": APP_NAME,
         "agent_name": AGENT_NAME,
@@ -284,14 +607,50 @@ def get_config() -> dict[str, Any]:
             "max_failed_attempts": settings.max_failed_attempts,
             "out_of_scope_limit": settings.out_of_scope_limit,
             "max_persuasion_attempts": settings.max_persuasion_attempts,
+            "max_turns_per_conversation": agent.settings.max_turns_per_conversation,  # the engine enforces it
+            "max_message_chars": MAX_MESSAGE_CHARS,
         },
         "sample_prompts": SAMPLE_PROMPTS,
         "fixtures_exposed": settings.expose_fixtures,
     }
 
 
+@app.get("/api/stats")
+async def get_stats() -> dict[str, Any]:
+    """Load and health of this process, for operators. No conversation content or identifiers."""
+    rt = runtime
+    try:
+        store = await anyio.to_thread.run_sync(rt.store.stats)
+    except StoreError:
+        store = {"kind": rt.store.kind, "unavailable": True}
+    pid = os.getpid()
+    return {
+        "uptime_seconds": round(time.monotonic() - rt.stats.started, 1),
+        "process": {"pid": pid},
+        "store": store,
+        "turn_slots": {"in_use": rt.slots.in_use, "max": rt.slots.size, "waiting": rt.slots.waiting},
+        "counters": {
+            "scope": f"this process (pid {pid}) since it started; each worker or instance counts its own",
+            **rt.stats.counts(),
+        },
+        "turn_latency_ms": {
+            "scope": "last 1,000 answered turns in this process, from a free turn slot to the commit",
+            **rt.stats.latency(),
+        },
+        "limits": {
+            "max_concurrent_turns": rt.slots.size,
+            "turn_slot_wait_seconds": rt.settings.turn_slot_wait_seconds,
+            "conversation_wait_seconds": rt.settings.conversation_wait_seconds,
+            "max_sessions": rt.store.max_sessions,
+            "max_turns_per_conversation": agent.settings.max_turns_per_conversation,
+            "max_body_bytes": MAX_BODY_BYTES,
+            "rate_limit_per_minute": rt.settings.rate_limit_per_minute or None,
+        },
+    }
+
+
 @app.get("/api/fixtures")
-def get_fixtures() -> dict[str, Any]:
+async def get_fixtures() -> dict[str, Any]:
     """Demo aid: the test identities and their claims, so an evaluator knows what to type."""
     if not settings.expose_fixtures:
         raise ApiError("not_found", "Fixtures are not exposed on this deployment.", 404)
@@ -315,9 +674,14 @@ def get_fixtures() -> dict[str, Any]:
 
 
 @app.post("/api/sessions")
-def create_session(body: NewSession | None = None) -> dict[str, Any]:
+def create_session(request: Request, body: NewSession | None = None) -> dict[str, Any]:
+    _rate_limit(request, "create")
     state = agent.new_session((body.consent_scenario if body else "default"))
-    store.put(state)
+    try:
+        runtime.store.create(state)
+    except StoreUnavailable as exc:
+        raise _store_unavailable() from exc
+    runtime.stats.count("conversations_created")
     return {
         "session_id": state.session_id,
         "messages": state.messages,
@@ -327,7 +691,13 @@ def create_session(body: NewSession | None = None) -> dict[str, Any]:
 
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str) -> dict[str, Any]:
-    state, _ = store.get(session_id)
+    _check_session_id(session_id)
+    try:
+        state = runtime.store.read(session_id)
+    except SessionNotFound as exc:
+        raise ApiError("session_not_found", "This conversation no longer exists on the server.", 404) from exc
+    except StoreUnavailable as exc:
+        raise _store_unavailable() from exc
     return {
         "session_id": state.session_id,
         "messages": state.messages,
@@ -337,34 +707,114 @@ def get_session(session_id: str) -> dict[str, Any]:
 
 
 @app.post("/api/sessions/{session_id}/messages")
-def post_message(
-    session_id: str, body: NewMessage, x_api_key: str | None = Header(default=None)
+async def post_message(
+    session_id: str, body: NewMessage, request: Request, x_api_key: str | None = Header(default=None)
 ) -> dict[str, Any]:
     text = body.text.strip()
     if not text:
         raise ApiError("bad_request", "The message is empty.", 400)
-    _, lock = store.get(session_id)
-    backend = get_backend(x_api_key)
-    with lock:  # one turn at a time per conversation
-        # Read the state only once the lock is held, so a second request that was waiting
-        # sees the first one's result instead of overwriting it.
-        state, _ = store.get(session_id)
-        # Work on a copy and commit only on success, so a failed model call (bad key,
-        # rate limit, outage) leaves the conversation exactly as it was and can be retried.
-        working = copy.deepcopy(state)
-        try:
-            reply, trace = agent.handle_turn(working, text, backend)
-        except LLMError as exc:
-            raise ApiError(exc.code, exc.message, exc.status) from exc
-        except Exception as exc:  # noqa: BLE001 - surface as a clean API error
-            log.exception("turn failed")
-            raise ApiError("llm_error", f"The turn could not be processed ({type(exc).__name__}).", 502) from exc
-        store.put(working)
-    return {"reply": reply, "state": working.to_view(settings), "trace": trace}
+    try:
+        text.encode("utf-8")
+    except UnicodeEncodeError:  # e.g. a lone surrogate from a \ud800 escape: not text
+        raise ApiError("bad_request", "The message contains characters that are not valid text.", 400) from None
+    _check_session_id(session_id)
+    _rate_limit(request, "turn")
+    rt = runtime
+    waited_from = time.perf_counter()
+    if not await rt.slots.acquire(rt.settings.turn_slot_wait_seconds):
+        rt.stats.count("refused_busy_503")
+        _log_turn(session_id, "?", None, 503, "server_busy", time.perf_counter() - waited_from)
+        raise ApiError(
+            "server_busy",
+            "The server is answering as many messages as it can right now; please try again shortly.",
+            503,
+            retry_after=rt.stats.retry_after(),
+        )
+    try:
+        return await anyio.to_thread.run_sync(
+            _run_turn, rt, session_id, text, x_api_key, limiter=_turn_thread_limiter(rt.slots.size)
+        )
+    finally:
+        rt.slots.release()
+
+
+def _run_turn(rt: Runtime, session_id: str, text: str, api_key: str | None) -> dict[str, Any]:
+    """One turn, on a worker thread, holding a turn slot."""
+    started = time.perf_counter()
+    status, code, phase_before = 200, "", "?"  # "?": the conversation was never read
+    trace: dict[str, Any] | None = None
+    try:
+        with rt.store.turn(session_id, wait=rt.settings.conversation_wait_seconds) as held:
+            state = held.state  # a private copy: the store hands one out per turn
+            phase_before = state.phase.value
+            backend = get_backend(api_key)
+            try:
+                reply, trace = agent.handle_turn(state, text, backend)
+            except ConversationClosed as exc:
+                rt.stats.count("closed_at_message_limit_409")
+                raise ApiError("conversation_closed", str(exc), 409) from exc
+            except LLMError as exc:
+                rt.stats.count("model_errors")
+                raise ApiError(exc.code, exc.message, exc.status) from exc
+            except Exception as exc:  # noqa: BLE001 - surface as a clean API error
+                rt.stats.count("model_errors")
+                log.exception("turn failed")
+                raise ApiError("llm_error", f"The turn could not be processed ({type(exc).__name__}).", 502) from exc
+            # Committed only now: a failed turn leaves the conversation exactly as it was.
+            held.commit()
+    except ApiError as exc:
+        status, code = exc.status, exc.code
+        raise
+    except SessionNotFound:
+        status, code = 404, "session_not_found"
+        raise ApiError("session_not_found", "This conversation no longer exists on the server.", 404) from None
+    except ConversationBusy:
+        status, code = 409, "conversation_busy"
+        rt.stats.count("conflicts_409")
+        raise ApiError(
+            "conversation_busy",
+            "This conversation is still answering an earlier message; please try again in a moment.",
+            409,
+            retry_after=1,
+        ) from None
+    except StoreUnavailable:
+        status, code = 503, "server_busy"
+        raise _store_unavailable() from None
+    finally:
+        elapsed = time.perf_counter() - started
+        _log_turn(session_id, phase_before, trace, status, code, elapsed)
+    rt.stats.turn_answered(elapsed)
+    return {"reply": reply, "state": state.to_view(settings), "trace": trace}
+
+
+def _log_turn(
+    session_id: str, phase_before: str, trace: dict[str, Any] | None, status: int, code: str, seconds: float
+) -> None:
+    """One line per turn: no message text, no identifiers (the session id is cut to 8 characters)."""
+    phase_after = trace.get("phase_after", phase_before) if trace and status == 200 else phase_before
+    parts = [f"turn {session_id[:8]}", f"phase={phase_before}->{phase_after}", f"status={status}"]
+    if code:
+        parts.append(code)
+    parts.append(f"latency={seconds * 1000:.0f}ms")
+    if trace:
+        calls, tokens_in, tokens_out = 0, 0, 0
+        for event in trace.get("events", []):
+            meta = event.get("detail") if event.get("kind") == "llm" else None
+            if event.get("kind") == "decision" and isinstance(event.get("detail"), dict):
+                meta = event["detail"].get("llm")
+            if not isinstance(meta, dict):
+                continue
+            calls += 1
+            tokens_in += meta.get("input_tokens") or 0
+            tokens_out += meta.get("output_tokens") or 0
+        parts.append(f"model_calls={calls}")
+        if tokens_in or tokens_out:
+            parts.append(f"tokens_in={tokens_in} tokens_out={tokens_out}")
+    turn_log.info(" ".join(parts))
 
 
 @app.api_route("/", methods=["GET", "HEAD"], include_in_schema=False)
-def index() -> FileResponse:
+async def index() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html", headers={"Cache-Control": "no-store"})
 
 

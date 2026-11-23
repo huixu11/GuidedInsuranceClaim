@@ -9,13 +9,14 @@ nothing crashed.
 
 from __future__ import annotations
 
+import json
 import random
 from typing import Any
 
 import pytest
 
 from insurance_claims import identity
-from insurance_claims.state import Phase
+from insurance_claims.state import Phase, SessionState
 from insurance_claims.understanding import (
     CASE_TYPES,
     CLAIM_STATUSES,
@@ -161,6 +162,11 @@ def check_invariants(convo: Conversation, repo: Any, settings: Any, before: dict
     blob = str(convo.last_trace) + str(s.to_view(settings))
     for h in repo.policyholders:
         assert h.dob not in blob and h.email not in blob and h.phone[-10:] not in blob
+
+    # What a session store keeps is the whole state, losslessly: strict JSON (no NaN), and read
+    # back it is equal field by field, so a conversation continues the same on any instance.
+    text = json.dumps(s.to_record(), allow_nan=False)
+    assert SessionState.from_record(json.loads(text)) == s
 
 
 def play(seed: int, agent: Any, repo: Any, settings: Any, turns: int = 30) -> Conversation:

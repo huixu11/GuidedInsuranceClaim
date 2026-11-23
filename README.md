@@ -83,7 +83,10 @@ asked for one), optionally with `ANTHROPIC_API_KEY` as a secret there.
 
 Worth knowing about the free plan: the service stops after 15 minutes without traffic and takes
 about a minute to wake on the next request, and conversations live in server memory, so they
-start afresh after a wake-up or a redeploy. Every push to the default branch redeploys.
+start afresh after a wake-up or a redeploy. Every push to the default branch redeploys. It is one
+small instance (512 MB, a fraction of a CPU), there to show the workflow rather than to carry
+load; the Blueprint lowers the conversation caps to fit that memory
+([Scaling and limits](#scaling-and-limits)).
 
 ---
 
@@ -316,6 +319,16 @@ still be verified. No gate is ever relaxed as part of de-escalation.
 | `SOP_MAX_PERSUASION_ATTEMPTS` | `2` | Attempts to persuade a caller who refuses verification |
 | `SOP_EXPOSE_FIXTURES` | `1` | Show fixture data in the UI's Test data drawer |
 | `HOST`, `PORT` | `127.0.0.1`, `8000` | Bind address (the Docker image binds `0.0.0.0`) |
+| `SOP_SESSION_STORE` | `memory` | Where conversations live: `memory` (this process) or a SQLite file (`sqlite:///path/sessions.db` or a plain path) shared by the workers and instances on one machine |
+| `SOP_WORKERS` | `1` | Worker processes (same as `--workers`); more than one needs the SQLite store |
+| `SOP_MAX_CONCURRENT_TURNS` | `64` | Turns processed at once per process; beyond that a turn waits briefly, then gets `503` |
+| `SOP_MAX_TURNS_PER_CONVERSATION` | `60` | Caller messages per conversation; the last one is answered by a handoff to a human |
+| `SOP_MAX_SESSIONS`, `SOP_MAX_STORE_MB`, `SOP_SESSION_TTL_SECONDS` | `50000`, `1024`, `14400` | Conversations held, state held in memory (memory store), idle expiry |
+| `SOP_RATE_LIMIT_PER_MINUTE`, `SOP_TRUST_PROXY` | `0` (off), `0` | Optional per-client limit, and whether the client is the last `X-Forwarded-For` hop |
+| `SOP_MOCK_LATENCY_MS` | `0` | Offline double only: time each simulated model call takes, for load tests |
+
+The serving settings, the remaining waits and what each limit answers are described in
+[Scaling and limits](#scaling-and-limits).
 
 A turn makes two to four model calls (understand; resolve on the turn a claim is selected;
 respond; one more if the model calls a tool). The structured calls are short extraction and
@@ -324,6 +337,228 @@ phrases the replies. Measured on the ten scripted scenarios with the defaults (l
 typically 3–5 s per turn, and 6–9 s for a turn that verifies, selects the claim and answers in
 one go or that calls a tool. With `claude-opus-5-5` for everything the scenarios reached the
 same outcomes at typically 5–7 s per turn (10–13 s for the heaviest turns).
+
+## Scaling and limits
+
+### What one process does, and why
+
+A turn spends almost all of its time waiting for the model: two to four blocking calls to the
+Messages API, a few seconds in all. The server is built around that:
+
+1. **Before anything is parsed**, a request body over 16 KB is refused (`413`), by its declared
+   length or, without one, by counting the bytes as they arrive. A message is at most 4,000
+   characters (`400` beyond).
+2. **Optionally**, a per-client token bucket answers `429` (off by default, see below).
+3. **A turn slot.** At most `SOP_MAX_CONCURRENT_TURNS` turns run at once. A turn waits for a slot
+   without holding a thread, first come first served, for at most `SOP_TURN_SLOT_WAIT_SECONDS`;
+   then it gets `503 server_busy` with a `Retry-After` of about one turn's time. Refusing quickly
+   keeps latency and memory bounded when demand exceeds capacity, instead of building a queue
+   whose requests all time out.
+4. **A worker thread** from a pool of the same size, used for turns only, so turns can never take
+   the threads that serve everything else. Health checks, config, `/api/stats`, the UI's files,
+   reading a conversation and starting one need no turn slot: a server whose slots are all busy
+   still answers them at once (`test_serving.py` checks this).
+5. **The conversation itself.** One turn at a time per conversation, through the session store.
+   A second message for a conversation that is mid-turn waits up to
+   `SOP_CONVERSATION_WAIT_SECONDS`, then gets `409 conversation_busy` (`Retry-After: 1`).
+   The turn works on a private copy of the state, which is written back only when the turn
+   succeeds: a turn that fails or is refused leaves the conversation exactly as it was.
+6. **The message cap.** The `SOP_MAX_TURNS_PER_CONVERSATION`-th caller message is not read; it
+   is answered by a handoff to a human, through the same escalation path as the other handoffs
+   (fixed wording, a handoff summary, no model call). Anything after that is refused with
+   `409 conversation_closed`. This bounds the size and the model cost of any one conversation.
+
+| Answer | Error code | When | `Retry-After` | The test UI |
+|---|---|---|---|---|
+| `400` | `bad_request` | Malformed body, empty or over-long message, text that is not valid Unicode | — | error row |
+| `413` | `payload_too_large` | Body over 16 KB | — | error row |
+| `429` | `rate_limited` | The client's budget is spent (only with the rate limit on) | until the next token | retries by itself (≤10 s) |
+| `503` | `server_busy` | No turn slot free within the wait (or the SQLite store locked for 5 s) | ≈ median turn time | retries by itself |
+| `409` | `conversation_busy` | The same conversation is mid-turn beyond the wait | `1` | retries by itself |
+| `409` | `conversation_closed` | The message cap was reached earlier | — | error row, no retry |
+| `404` | `session_not_found` | Never created, expired, or evicted to make room | — | offers a new conversation |
+
+Every one uses the error envelope `{"error": {"code", "message"}}` and changes nothing. The UI
+retries a busy answer up to three times, honouring `Retry-After`, while the typing indicator
+stays up; only then does it show the error row with its Retry button.
+
+### The arithmetic for live turns
+
+- **Turns per process.** A live turn takes typically 3–5 s (see above). With 64 slots one process
+  answers at most about 64 / 4 s ≈ 16 turns per second. A caller sends a message every 20–30 s
+  or so (reading, typing, waiting), so that is in the order of 400 callers in conversation at
+  once per process — provided the model API account allows ~16 turns × 3 calls ≈ 50 requests a
+  second and the tokens that go with them. In practice the account's rate limits are the first
+  ceiling: set `SOP_MAX_CONCURRENT_TURNS` to what the account sustains, and the server refuses
+  the rest cleanly instead of collecting the API's `429`s.
+- **Threads.** 64 turn threads plus the default pool of 40 for everything else, per process.
+  Turns are I/O-bound, so the GIL is not the limit; CPU per turn is a few milliseconds.
+- **Memory.** The state of a conversation is kept as JSON: ~2 KB new, ~20 KB after a typical
+  four-message call, ~160 KB at the 60-message cap, up to ~370 KB if every message is 4,000
+  characters. 50,000 conversations of typical length are about 1 GB, so the memory store also
+  keeps to `SOP_MAX_STORE_MB` (1,024 by default) and evicts the least recently used beyond it.
+  Size both to the machine. `/api/stats` shows `state_bytes_held`.
+- **Cost.** The message cap bounds the model calls of one conversation to about 60 × 3.
+
+### Settings
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SOP_MAX_CONCURRENT_TURNS` | `64` | Turn slots per process, and the size of the turn thread pool |
+| `SOP_TURN_SLOT_WAIT_SECONDS` | `2` | How long a turn waits for a slot before `503` |
+| `SOP_CONVERSATION_WAIT_SECONDS` | `5` | How long a message waits for its conversation's previous turn before `409` |
+| `SOP_MAX_TURNS_PER_CONVERSATION` | `60` | Caller messages per conversation; the last one is answered by a handoff |
+| `SOP_SESSION_STORE` | `memory` | `memory`, or a SQLite file: `sqlite:///relative/path.db`, `sqlite:////absolute/path.db`, or a plain path |
+| `SOP_MAX_SESSIONS` | `50000` | Conversations held; the least recently used is evicted beyond it (both stores) |
+| `SOP_MAX_STORE_MB` | `1024` | Memory store only: state held; the least recently used is evicted beyond it (`0` = no limit) |
+| `SOP_SESSION_TTL_SECONDS` | `14400` | An idle conversation expires (checked on every read and turn) |
+| `SOP_TURN_LEASE_SECONDS` | `300` | SQLite store: a turn's hold on a conversation lapses by itself after this, so a crashed worker cannot lock it forever. Keep it well above the longest turn; a turn that outlives it is not written (`409`) rather than overwrite a newer one |
+| `SOP_WORKERS` | `1` | Worker processes (`--workers N`); more than one is refused with the memory store |
+| `SOP_RATE_LIMIT_PER_MINUTE` | `0` | Messages per client per minute, per instance; new conversations get a quarter of it (at least 1). `0` = off |
+| `SOP_TRUST_PROXY` | `0` | `1`: the client is the last `X-Forwarded-For` hop (the address your own proxy saw), for the rate limit. Otherwise the socket peer |
+| `SOP_MOCK_LATENCY_MS` | `0` | Offline double only: each simulated model call sleeps this long |
+
+"Last use", for expiry and eviction, is the creation of a conversation or the start or commit of
+one of its turns; reading it is not use. A conversation mid-turn is never evicted or expired.
+
+The rate limiter is in memory, so each worker and each instance keeps its own buckets: it
+protects one process from one noisy client, nothing more. A global limit, quotas per user and
+authentication belong in a gateway in front of the instances.
+
+### Several workers, several instances
+
+Conversations in the memory store belong to one process, so `--workers N` (or `SOP_WORKERS`)
+with N > 1 is refused at start until `SOP_SESSION_STORE` names a SQLite file, which every
+worker and every instance on the machine then shares (and which survives a restart):
+
+```bash
+SOP_SESSION_STORE=sqlite:///sessions.db python -m insurance_claims --workers 4   # ./sessions.db
+# two instances, one store, any request to either:
+SOP_SESSION_STORE=/data/sessions.db python -m insurance_claims --port 8001 &
+SOP_SESSION_STORE=/data/sessions.db python -m insurance_claims --port 8002 &
+# containers share it through a volume (the image's /data belongs to its user):
+docker run -d -p 8001:8000 -v sop-sessions:/data -e SOP_SESSION_STORE=/data/sessions.db sop-agent
+docker run -d -p 8002:8000 -v sop-sessions:/data -e SOP_SESSION_STORE=/data/sessions.db -e SOP_WORKERS=2 sop-agent
+```
+
+How the SQLite store keeps a conversation to one turn at a time across processes, and what a
+crash does, is in the docstring of `insurance_claims/store.py`. Its limits: one machine (keep the
+file on a local disk; network filesystems do not lock reliably), and one writer at a time (a turn
+writes twice), which is far more than the model allows but not unlimited. Each process has its
+own turn slots and counters, so N workers have N × `SOP_MAX_CONCURRENT_TURNS` slots in all.
+
+### Watching it
+
+`GET /api/stats` reports, without any conversation content or identifiers: the store and the
+conversations it holds, turn slots in use and waiting, counters since start (conversations
+created, turns answered, `503`, `409`, `429`, `413`, model errors, conversations closed at the
+cap), the median and p95 latency of the last 1,000 turns, uptime and the process id. With the
+SQLite store the conversations held are the shared total; counters and latency are per process,
+and the response says so. Each turn also writes one log line, without message text or
+identifiers (the conversation id is cut to 8 characters, in the access log too):
+
+```
+INFO:sop.turn:turn 1eddf222 phase=VERIFY_ID->PROCESS_CASE status=200 latency=2ms model_calls=3
+INFO:sop.turn:turn ac2c58f0 phase=?->? status=409 conversation_busy latency=5003ms
+```
+
+### Load test
+
+`scripts/load_test.py` (standard library only) plays many simulated callers at once against one
+or more running instances and checks every conversation, not just status codes: each turn moves
+the turn counter by exactly one, each conversation ends where its script says (verified on the
+right claim, email sent once or skipped, handed off), no reply names another policyholder's
+claim, reading a conversation back gives what the last turn returned, and eight messages sent at
+the same instant to one conversation are all answered, one at a time. It honours `Retry-After`
+like a client would and exits non-zero if any conversation went wrong. It refuses to run against
+the live model.
+
+```bash
+python -m insurance_claims --mock --port 8021 &
+python scripts/load_test.py http://127.0.0.1:8021 --callers 400 --concurrency 100
+
+# two instances sharing one store; each conversation alternates between them
+SOP_SESSION_STORE=/tmp/sessions.db python -m insurance_claims --mock --port 8021 &
+SOP_SESSION_STORE=/tmp/sessions.db python -m insurance_claims --mock --port 8022 &
+python scripts/load_test.py http://127.0.0.1:8021 http://127.0.0.1:8022 --callers 400 --concurrency 100
+
+# make the offline double as slow as the model, so the turn slots fill and 503 + Retry-After show
+SOP_MOCK_LATENCY_MS=1500 python -m insurance_claims --mock --port 8023 &
+python scripts/load_test.py http://127.0.0.1:8023 --callers 200 --concurrency 150
+```
+
+The offline double answers in about a millisecond, so without `SOP_MOCK_LATENCY_MS` the test
+measures the harness itself (HTTP, store, engine) and the load generator on the same machine;
+with it, the turn slots and the waits behave as they would in front of the model.
+
+**Measured** with the commands above on a laptop (Intel i5-1245U, Windows, Python 3.14), server
+and load generator on the same machine, offline double:
+
+| Setup | Callers / at once | Conversations correct | Turns/s | Turn latency p50 / p95 | Asked to come back later |
+|---|---|---|---|---|---|
+| 1 process, memory store (7 runs) | 400 / 100 | 400 of 400, every run | 116–162 | 293–395 ms / 351–649 ms | 0 |
+| 2 processes, one SQLite file (2 runs) | 400 / 100 | 400 of 400, both runs | 172–224 | 288–358 ms / 577–847 ms | 0 |
+| 1 process, 2 workers, SQLite | 400 / 100 | 400 of 400 | 171 | 386 ms / 588 ms | 0 |
+| 1 process, `SOP_MOCK_LATENCY_MS=1500`, within the slots | 120 / 60 | 120 of 120 | 13 | 3.0 s / 4.5 s | 0 |
+| 1 process, `SOP_MOCK_LATENCY_MS=1500`, over the slots | 200 / 150 | 200 of 200 | 16 | 4.6 s / 6.2 s | 304 × `503`, all answered on retry |
+
+How to read it:
+
+- **Latency is what the caller sees, queueing included.** In the first row 100 callers send at
+  once to one process, and almost all of the 300–400 ms is waiting in line for it: on the server,
+  `/api/stats` showed a median of 2.5 ms and a p95 of 7.8 ms per turn. With SQLite (rows two and
+  three) part of the wait is for the file's single writer (server-side medians of 80–370 ms at
+  this load). In the last two rows the latency is the simulated model (two or three calls of
+  1.5 s) plus, over the slots, the wait for one.
+- **Absolute numbers moved with the machine.** The laptop's speed drifted by a factor of about
+  three during the day: the previous version of the server measured about 400 turns/s when the
+  machine was cool, and 127–142 turns/s later, in runs alternated with the 124–139 turns/s of
+  this version. Compare rows measured together.
+- **More processes help even here.** Two processes answered more turns per second than one,
+  although they share one SQLite writer, because the engine's own work then runs on two cores.
+- **The slots do what they are for.** Within them nothing is refused and the latency is the
+  model's. Over them, throughput stays at what 64 slots give (64 ÷ ~4 s ≈ 16 turns/s), the
+  excess is told when to come back, and every conversation still ends correctly.
+
+Two more checks, done by hand:
+
+- **A conversation outlives its instance.** With two instances on one SQLite file, a conversation
+  was verified on the first, the first was killed, and the second read it back (same phase, same
+  turn, same messages) and finished it through `POST_PROCESS`.
+- **Open conversations do not slow the server down.** 32,000 conversations were created by 16
+  threads (a tenth of them with one message), and after each quarter 200 single turns were timed
+  on fresh conversations. The same run against the previous version of the server, whose store
+  looked through every conversation on each write, is alongside:
+
+  | Open conversations | New conversations/s | Turn p50 / p95 | Previous version: new conversations/s | Previous version: turn p50 / p95 |
+  |---|---|---|---|---|
+  | 200 | — | 8.0 ms / 11.7 ms | — | 8.0 ms / 11.0 ms |
+  | 8,400 | 271 | 7.1 ms / 11.1 ms | 184 | 12.1 ms / 17.2 ms |
+  | 16,600 | 265 | 8.3 ms / 15.3 ms | 97 | 14.1 ms / 18.1 ms |
+  | 24,800 | 272 | 8.1 ms / 13.0 ms | 87 | 11.3 ms / 21.3 ms |
+  | 33,000 | 263 | 8.4 ms / 12.9 ms | 65 | 16.9 ms / 25.4 ms |
+
+  The process grew from 106 MB to 199 MB (78 MB of it conversation state, as `/api/stats`
+  reports); the previous version reached 290 MB. Beyond `SOP_MAX_SESSIONS` or `SOP_MAX_STORE_MB`
+  the least recently used conversation is dropped: with a cap of 300, creating 500 more left 300
+  held, and the oldest answered `404`.
+
+### What is not here, and would be for production
+
+- **A networked session store** (Redis or Postgres) for instances on several machines. The
+  interface is small and the record is plain JSON (`store.py` says how the lease maps onto each);
+  they are not included because they cannot be exercised here.
+- **Asynchronous model calls.** Each running turn holds a thread while it waits for the model;
+  the async client would let one process keep far more turns in flight, with the slots still as
+  the bound.
+- **A gateway in front**: TLS, authentication, global rate limits and per-user quotas, and size
+  limits at the edge. The limiter here is per instance.
+- **Idempotent side effects.** Consent requests and the email are simulated; real ones need an
+  outbox or idempotency keys, because a failed turn is retried from the start.
+- **Metrics and tracing** (Prometheus, OpenTelemetry) and alerts. `/api/stats` is per process
+  and in memory.
+- **Throttling failed verification per policyholder record** across conversations (see
+  Assumptions).
 
 ## Tests
 
@@ -334,7 +569,7 @@ python scripts/run_scenarios.py          # scripted conversations against the li
 SOP_LLM_MODE=mock python scripts/run_scenarios.py demo frustrated   # same, offline
 ```
 
-The suite runs without a model, in five layers:
+The suite runs without a model:
 
 - `test_sop_flow.py` scripts the model's *reading* of each message and asserts what the harness
   does with it: the demo case, memory across phases, mismatch lockout, the refusal ladder, scope
@@ -344,8 +579,9 @@ The suite runs without a model, in five layers:
   conversations with arbitrary schema-valid readings (contradictory flags, other people's
   identifiers and claim numbers, role flips, refusals), asserting after every turn that nothing
   behind the gate was touched before verification, verification is never re-pointed or undone,
-  only owned claims are selected, email is sent only on a yes, and nothing crashes. A companion
-  test checks that those random runs really reach every phase and every escalation reason.
+  only owned claims are selected, email is sent only on a yes, nothing crashes, and the state
+  survives the session store's JSON record unchanged. A companion test checks that those random
+  runs really reach every phase and every escalation reason.
 - `test_review_regressions.py` pins the defects an adversarial review of the harness found
   (representative-name swaps, an unguarded email summary, ambiguous "yes", refusal-ladder
   stalling, prompt-structure injection through the reading, tool-loop and truncation handling).
@@ -355,6 +591,22 @@ The suite runs without a model, in five layers:
   back — and how refusals and auth errors are handled.
 - `test_api.py` covers the HTTP contract, including that a failed model call leaves the
   conversation untouched so the message can be retried.
+- `test_store.py` holds both session stores to one contract: create, read, turn and commit,
+  nothing written when a turn fails, not found, expiry, the cap and its eviction order, the
+  bounded wait for a busy conversation, no lost update with many threads; for SQLite also two
+  store objects and a second operating-system process on one file, and a crashed worker's
+  lease lapsing with its late commit refused.
+- `test_serving.py` fills the turn slots with held turns and checks that health, config, stats,
+  static files, reads and new conversations still answer at once while an extra turn gets `503`
+  with `Retry-After`; it also covers `409`, `413` (declared and streamed), `429`, the message
+  cap, `/api/stats`, the turn log, the refusal of several workers without a shared store, and
+  many conversations at once on threads with either store, compared with the same scripts run
+  one at a time.
+- `test_hostile_http.py` sends malformed and extreme input (invalid JSON, wrong types, missing
+  fields, 4,000- and 4,001-character messages, control characters and NUL, emoji, right-to-left
+  text, lone surrogates, 7,000-deep JSON, huge and malformed conversation ids, unknown methods
+  and paths) with both stores: never a 5xx, always the envelope or a normal reply, and a refused
+  request changes nothing.
 
 `scripts/run_scenarios.py` is the live check: it plays ten scripted conversations (demo case,
 memory, frustration, refusal, mismatches, off-topic, representative, consent timeout, ambiguity,
@@ -366,10 +618,13 @@ human request) against the real model and prints each reply with the harness dec
 model key: it builds the image, checks what is in it, starts it in offline mode, waits for the
 image's own `HEALTHCHECK`, confirms it runs as the non-root `appuser`, and plays the demo test
 case through all four phases over the published port, then checks the brief's requirements one by
-one (`scripts/spec_check.py`). It then starts a second container in model
-mode with no key (expects a clean `missing_api_key`), a third in `auto` mode with no key (the
-hosted demo's configuration, which must answer offline and pass the same requirement checks),
-repeats the walk-through via `docker compose`, and runs the test suite inside `python:3.14-slim`.
+one (`scripts/spec_check.py`), and runs the load test against it. It then starts a second
+container in model mode with no key (expects a clean `missing_api_key`), a third in `auto` mode
+with no key (the hosted demo's configuration, which must answer offline and pass the same
+requirement checks), two more that share a SQLite session store on a volume (one with two
+workers) for a load test whose conversations alternate between them, checks that the image
+refuses several workers with the in-memory store, repeats the walk-through via
+`docker compose`, and runs the test suite inside `python:3.14-slim`.
 
 The same walk-through by hand, against any running instance:
 
@@ -404,14 +659,16 @@ insurance_claims/
   replies.py           template wording for every directive
   guard.py             output checks (leak + grounding)
   agent.py             turn orchestrator
-  state.py             session state and its display-safe view
-  server.py            FastAPI app and API
+  state.py             session state, its display-safe view and its JSON record
+  store.py             session stores: in memory, or a SQLite file shared by processes
+  server.py            FastAPI app and API: turn slots, limits, error envelope, /api/stats
   static/              the test UI (plain HTML/CSS/JS, no build step)
 SUBMISSION.md                one-page cover note for reviewers
 render.yaml                  Render Blueprint for a hosted copy of the demo
 scripts/run_scenarios.py     scripted conversations against the live model (or offline)
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
 scripts/spec_check.py        the brief, requirement by requirement, against an offline instance
+scripts/load_test.py         many simulated callers against running instances, each conversation checked
 .github/workflows/docker.yml image build + container checks + test suite on Linux
 tests/
 ```
@@ -427,8 +684,10 @@ tests/
 - **Email** goes only to the address on file, shown masked. The "send" is simulated: the message
   lands in an in-memory outbox displayed in the UI.
 - **Human transfer** is simulated: the conversation is closed and a handoff summary is produced.
-- **Sessions** are in memory (lost on restart); the store is a small class to swap for Redis or
-  a database.
+- **Sessions** are in memory by default (lost on restart), capped in number, size and idle time.
+  `SOP_SESSION_STORE` switches to a SQLite file that the workers and instances on one machine
+  share and that survives a restart; Redis or Postgres would implement the same small interface
+  for several machines ([Scaling and limits](#scaling-and-limits)).
 - **Verification feedback.** The agent tells the caller which identifiers matched and which did
   not (by field name). That is what makes partial answers and corrections feel natural, and it
   is what a human representative does, but it does confirm a correct guess. Strikes are counted

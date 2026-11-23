@@ -400,6 +400,9 @@ def _section(action: str, f: dict[str, Any], state: SessionState, settings: Sett
             "repeated_out_of_scope": (
                 "You can only help with claims here; a representative can point them in the right direction."
             ),
+            "turn_limit": (
+                "This chat has reached its maximum length; a representative will take it from here."
+            ),
         }.get(f["reason"], "")
         out += [
             f"situation: the controller is transferring this conversation to a human representative "

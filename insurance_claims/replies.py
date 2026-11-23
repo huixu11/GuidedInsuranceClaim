@@ -224,6 +224,7 @@ def _core(d: P.Directive, state: SessionState, settings: Settings) -> str:
             ),
             "verification_refused": "I understand, and I respect that.",
             "repeated_out_of_scope": "I'm only able to help with insurance claims here, so",
+            "turn_limit": "This conversation has reached the maximum length for one chat, so",
         }.get(f["reason"], "")
         tail = (
             " They'll need to verify your identity before discussing claim details."

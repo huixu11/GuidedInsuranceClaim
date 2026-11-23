@@ -54,6 +54,7 @@ ESCALATION_REASONS = {
     "verification_failed": "identity could not be verified within the allowed attempts",
     "verification_refused": "the caller declined identity verification after it was explained",
     "repeated_out_of_scope": "the caller kept asking about topics outside claims support",
+    "turn_limit": "the conversation reached the maximum number of messages for one chat",
 }
 
 
@@ -173,6 +174,30 @@ def step(
             break
     if directive is None:  # defensive: should be unreachable
         raise sop.SOPViolation("policy engine did not produce a directive")
+    return _finish(ctx, directive)
+
+
+def close_at_turn_limit(
+    state: SessionState,
+    tools: Toolbox,
+    backend: PolicyBackend,
+    trace: Trace,
+    settings: Settings,
+    repo: Repository,
+) -> Directive:
+    """The conversation has reached the most messages one conversation may hold: hand it to a
+    human through the normal escalation path. The message itself is not read (no model call),
+    and the reply is the fixed wording, so the last turn costs nothing and cannot go wrong."""
+    ctx = Ctx(state, Understanding(summary="(not read: message limit reached)"), tools, backend,
+              trace, settings, repo)
+    trace.add(
+        "gate",
+        f"message limit reached ({settings.max_turns_per_conversation} in this conversation) — "
+        "handing off instead of continuing",
+        None,
+    )
+    directive = _escalate(ctx, "turn_limit")
+    directive.deterministic = True
     return _finish(ctx, directive)
 
 
@@ -1025,6 +1050,7 @@ __all__ = [
     "Directive",
     "Modifiers",
     "step",
+    "close_at_turn_limit",
     "build_handoff_summary",
     "deterministic_summary",
     "render_email_body",

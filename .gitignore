@@ -6,3 +6,7 @@ __pycache__/
 .env
 *.zip
 .claude/
+# a SQLite session store (SOP_SESSION_STORE) kept in the project folder holds conversations
+*.db
+*.db-wal
+*.db-shm

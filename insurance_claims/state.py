@@ -7,11 +7,15 @@ block) built from it each turn.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any
 
 from .identity import FIELD_LABELS, MATCHED, NOT_PROVIDED, PII_FIELDS
+
+# Version of the stored record layout (`SessionState.to_record`). Bump it when a field changes
+# meaning, so a store can tell an old record from a new one.
+RECORD_FORMAT = 1
 
 
 class Phase(str, Enum):
@@ -33,6 +37,9 @@ HINT_LABELS = {
     "description": "Details",
 }
 
+# SessionState fields holding one MemoryItem or None (to_record / from_record).
+_MEMORY_ITEM_FIELDS = ("intent", "email_pref")
+
 
 @dataclass
 class MemoryItem:
@@ -46,6 +53,14 @@ class MemoryItem:
             "captured_turn": self.captured_turn,
             "captured_phase": self.captured_phase,
         }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> MemoryItem:
+        return cls(
+            value=data["value"],
+            captured_turn=data["captured_turn"],
+            captured_phase=data["captured_phase"],
+        )
 
 
 @dataclass
@@ -164,6 +179,56 @@ class SessionState:
         if self.intent:
             parts.append(f"wants: {self.intent.value.replace('_', ' ')}")
         return "; ".join(parts)
+
+    # -- storage -------------------------------------------------------------
+    def to_record(self) -> dict[str, Any]:
+        """Everything in the state as plain JSON data, for a session store.
+
+        Lossless: `SessionState.from_record(json.loads(json.dumps(s.to_record()))) == s`. Unlike
+        `to_view` (a display projection) it keeps every field, identifier values included, so a
+        record is as sensitive as the conversation itself. The result may share lists and dicts
+        with the state; serialise it before keeping it.
+        """
+        record: dict[str, Any] = {"format": RECORD_FORMAT}
+        for f in fields(self):
+            value = getattr(self, f.name)
+            if f.name == "phase":
+                value = value.value
+            elif f.name in _MEMORY_ITEM_FIELDS:
+                value = value.to_dict() if value is not None else None
+            elif f.name == "hints":
+                value = {k: item.to_dict() for k, item in value.items()}
+            elif f.name == "notes":
+                value = [item.to_dict() for item in value]
+            record[f.name] = value
+        return record
+
+    @classmethod
+    def from_record(cls, record: dict[str, Any]) -> SessionState:
+        """Rebuild a state from `to_record()` output (after a JSON round trip).
+
+        A field missing from the record takes its default, so records written before a field
+        was added still load. An unknown field is an error rather than silently dropped, since
+        the next commit would otherwise lose it.
+        """
+        data = dict(record)
+        fmt = data.pop("format", RECORD_FORMAT)
+        if fmt != RECORD_FORMAT:
+            raise ValueError(f"unsupported session record format {fmt!r}")
+        known = {f.name for f in fields(cls)}
+        unknown = sorted(set(data) - known)
+        if unknown:
+            raise ValueError(f"unknown fields in session record: {', '.join(unknown)}")
+        if "phase" in data:
+            data["phase"] = Phase(data["phase"])
+        for name in _MEMORY_ITEM_FIELDS:
+            if data.get(name) is not None:
+                data[name] = MemoryItem.from_dict(data[name])
+        if "hints" in data:
+            data["hints"] = {k: MemoryItem.from_dict(v) for k, v in data["hints"].items()}
+        if "notes" in data:
+            data["notes"] = [MemoryItem.from_dict(v) for v in data["notes"]]
+        return cls(**data)
 
     def to_view(self, settings: Any) -> dict[str, Any]:
         """Display-safe projection for the test UI (no identifier values)."""

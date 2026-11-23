@@ -16,6 +16,16 @@ os.environ["SOP_TODAY"] = "2026-03-02"
 # Pin the models too, so a developer's .env cannot change what the wire tests expect.
 os.environ["SOP_MODEL"] = "claude-opus-5-5"
 os.environ["SOP_MODEL_UNDERSTAND"] = "claude-haiku-5-5"
+# And the serving settings (README, "Scaling and limits"): the suite runs against the defaults
+# whatever a developer exported for a load test (a slow offline double, a SQLite store, a limiter).
+os.environ["SOP_MOCK_LATENCY_MS"] = "0"
+os.environ["SOP_SESSION_STORE"] = "memory"
+os.environ["SOP_RATE_LIMIT_PER_MINUTE"] = "0"
+os.environ["SOP_TRUST_PROXY"] = "0"
+os.environ["SOP_MAX_TURNS_PER_CONVERSATION"] = "60"
+os.environ["SOP_MAX_CONCURRENT_TURNS"] = "64"
+os.environ["SOP_MAX_SESSIONS"] = "50000"
+os.environ["SOP_MAX_STORE_MB"] = "1024"
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from insurance_claims.agent import Agent  # noqa: E402

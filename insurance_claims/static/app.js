@@ -76,6 +76,11 @@
     llm_error: 'Model error',
     bad_request: 'Request rejected',
     session_not_found: 'Conversation not found',
+    conversation_busy: 'Still answering',
+    server_busy: 'Server busy',
+    payload_too_large: 'Message too large',
+    conversation_closed: 'Conversation closed',
+    internal_error: 'Server error',
     network_error: 'Network error',
     timeout: 'No response',
     bad_response: 'Unreadable response',
@@ -87,7 +92,14 @@
   // After these errors the server state cannot have moved, so skip the resync GET.
   const NO_RESYNC = new Set([
     'aborted', 'session_not_found', 'network_error', 'missing_api_key', 'invalid_api_key', 'bad_request', 'render_error',
+    'server_busy', 'payload_too_large', 'rate_limited',
   ]);
+  // "Busy, come back shortly" answers (409 conversation_busy, 503 server_busy, any 429): the
+  // message is sent again by itself a few times, honouring Retry-After, while the typing
+  // indicator stays up; only then does the error row with its Retry button appear.
+  const AUTO_RETRY_CODES = new Set(['conversation_busy', 'server_busy']);
+  const AUTO_RETRIES = 3;
+  const AUTO_RETRY_MAX_WAIT_S = 10; // a longer Retry-After goes straight to the error row
 
   const PH_FIELDS = [
     ['name', 'Full name'],
@@ -366,12 +378,33 @@
   /* ====================================================================== API */
 
   class ApiError extends Error {
-    constructor(code, message, status) {
+    constructor(code, message, status, retryAfter) {
       super(message);
       this.name = 'ApiError';
       this.code = code;
       this.status = status || 0;
+      this.retryAfter = retryAfter || 0; // seconds, from a Retry-After header
     }
+  }
+
+  function canAutoRetry(err) {
+    return (AUTO_RETRY_CODES.has(err.code) || err.status === 429)
+      && (err.retryAfter || 1) <= AUTO_RETRY_MAX_WAIT_S;
+  }
+
+  // Resolves after `ms`, or at once when the request is cancelled.
+  function pause(ms, signal) {
+    return new Promise((resolve) => {
+      if (signal.aborted) {
+        resolve();
+        return;
+      }
+      const timer = window.setTimeout(resolve, ms);
+      signal.addEventListener('abort', () => {
+        window.clearTimeout(timer);
+        resolve();
+      }, { once: true });
+    });
   }
 
   function toApiError(err) {
@@ -429,7 +462,8 @@
       const message = e && typeof e.message === 'string' && e.message
         ? e.message
         : `The server responded with HTTP ${res.status}${res.statusText ? ` ${res.statusText}` : ''}.`;
-      throw new ApiError(code, message, res.status);
+      const retryAfter = Number.parseInt(res.headers.get('Retry-After') || '', 10);
+      throw new ApiError(code, message, res.status, Number.isFinite(retryAfter) && retryAfter > 0 ? retryAfter : 0);
     }
     if (!isObj(data)) {
       throw new ApiError('bad_response', 'The server sent a response this page could not read.', res.status);
@@ -1669,7 +1703,7 @@
     let node = null;
     if (app.sessionLost) {
       node = statusNote('bad', 'alert',
-        'This conversation no longer exists on the server (it was probably restarted).', true);
+        'This conversation no longer exists on the server (it expired, made room for newer ones, or the server restarted).', true);
     } else if (app.state && status === 'escalated') {
       node = statusNote('warn', 'user', 'Transferred to a human representative. This virtual session has ended.', true);
     } else if (app.state && status === 'completed') {
@@ -1774,13 +1808,22 @@
 
     let data = null;
     let error = null;
-    try {
-      data = await api('POST', `/api/sessions/${encodeURIComponent(sessionId)}/messages`, { text }, {
-        controller,
-        timeoutMs: MESSAGE_TIMEOUT_MS,
-      });
-    } catch (err) {
-      error = toApiError(err);
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        data = await api('POST', `/api/sessions/${encodeURIComponent(sessionId)}/messages`, { text }, {
+          controller,
+          timeoutMs: MESSAGE_TIMEOUT_MS,
+        });
+        error = null;
+      } catch (err) {
+        error = toApiError(err);
+      }
+      if (!error || attempt >= AUTO_RETRIES || !canAutoRetry(error) || controller.signal.aborted) break;
+      await pause((error.retryAfter || 1) * 1000, controller.signal);
+      if (controller.signal.aborted) {
+        error = new ApiError('aborted', 'The request was cancelled.');
+        break;
+      }
     }
     if (gen !== app.gen) return; // a new conversation started meanwhile
     app.sendController = null;
@@ -1838,6 +1881,12 @@
       showFailedRow(text, err, false, userRow);
       updateStatusUi();
       scrollChatToBottom(); // the note was added after the error row
+      return;
+    }
+    if (err.code === 'conversation_closed') {
+      // The message limit was reached (perhaps in another tab): nothing to retry; show the handoff.
+      showFailedRow(text, err, false, userRow);
+      resyncState();
       return;
     }
     showFailedRow(text, err, true, userRow);

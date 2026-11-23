@@ -9,6 +9,7 @@ substitute for the model's language understanding.
 from __future__ import annotations
 
 import re
+import time
 from typing import Any, Callable
 
 from . import identity, policy as P, replies
@@ -96,11 +97,22 @@ def _find_dob(text: str) -> tuple[str, str] | None:
 
 class MockBackend:
     name = "mock"
+    # Seconds slept in every model-call method (SOP_MOCK_LATENCY_MS), so a load test can emulate
+    # the model's latency without spending credit. 0 unless the server is configured otherwise.
+    latency_s: float = 0.0
+
+    def __init__(self, latency_ms: float = 0) -> None:
+        self.latency_s = max(0.0, float(latency_ms)) / 1000.0
+
+    def _model_latency(self) -> None:
+        if self.latency_s > 0:
+            time.sleep(self.latency_s)
 
     # -- understand ------------------------------------------------------------
     def understand(
         self, state: SessionState, user_text: str, settings: Settings
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._model_latency()
         t = user_text.strip()
         low = t.lower()
         last_agent = state.last_assistant_text().lower()
@@ -297,6 +309,7 @@ class MockBackend:
     def resolve(
         self, state: SessionState, claims: list[dict[str, Any]], settings: Settings
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._model_latency()
         hints = {k: v.value.lower() for k, v in state.hints.items()}
         texts = state.user_texts()
         last = texts[-1].lower() if texts else ""
@@ -360,6 +373,7 @@ class MockBackend:
     def summarize(
         self, state: SessionState, records: list[dict[str, Any]], settings: Settings
     ) -> tuple[dict[str, Any], dict[str, Any]]:
+        self._model_latency()
         return P.deterministic_summary(records), {"call": "summarize", "model": "mock"}
 
     # -- respond ---------------------------------------------------------------------
@@ -374,6 +388,7 @@ class MockBackend:
     ) -> Any:
         from .llm import RespondResult
 
+        self._model_latency()
         calls: list[dict[str, Any]] = []
         text = replies.template_reply(directive, state, settings)
         texts = state.user_texts()

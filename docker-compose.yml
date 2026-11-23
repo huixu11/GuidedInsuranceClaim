@@ -14,3 +14,25 @@ services:
       SOP_EFFORT_UNDERSTAND: ${SOP_EFFORT_UNDERSTAND:-low}
       SOP_TODAY: ${SOP_TODAY:-2026-03-02}
       SOP_EXPOSE_FIXTURES: ${SOP_EXPOSE_FIXTURES:-1}
+      # Serving (README, "Scaling and limits"). Default: one worker, conversations in memory.
+      # More than one worker needs the shared store, e.g. SOP_SESSION_STORE=/data/sessions.db.
+      SOP_WORKERS: ${SOP_WORKERS:-1}
+      SOP_SESSION_STORE: ${SOP_SESSION_STORE:-memory}
+      # Limits; left empty, each takes its built-in default.
+      SOP_MAX_CONCURRENT_TURNS: ${SOP_MAX_CONCURRENT_TURNS:-}
+      SOP_MAX_SESSIONS: ${SOP_MAX_SESSIONS:-}
+      SOP_MAX_STORE_MB: ${SOP_MAX_STORE_MB:-}
+      SOP_SESSION_TTL_SECONDS: ${SOP_SESSION_TTL_SECONDS:-}
+      SOP_MAX_TURNS_PER_CONVERSATION: ${SOP_MAX_TURNS_PER_CONVERSATION:-}
+      SOP_TURN_SLOT_WAIT_SECONDS: ${SOP_TURN_SLOT_WAIT_SECONDS:-}
+      SOP_CONVERSATION_WAIT_SECONDS: ${SOP_CONVERSATION_WAIT_SECONDS:-}
+      SOP_TURN_LEASE_SECONDS: ${SOP_TURN_LEASE_SECONDS:-}
+      SOP_RATE_LIMIT_PER_MINUTE: ${SOP_RATE_LIMIT_PER_MINUTE:-}
+      SOP_TRUST_PROXY: ${SOP_TRUST_PROXY:-}
+      SOP_MOCK_LATENCY_MS: ${SOP_MOCK_LATENCY_MS:-}
+    volumes:
+      # Where the SQLite session store lives when SOP_SESSION_STORE points into /data.
+      - sop-data:/data
+
+volumes:
+  sop-data:

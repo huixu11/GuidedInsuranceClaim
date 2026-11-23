@@ -107,6 +107,82 @@ Yes. Each line is covered by an automated check (`scripts/spec_check.py` runs th
 | Delivery 3: a simple test UI for chatting in natural language | A browser UI: chat on the left, the harness's state on the right. |
 | Delivery 4: the demo shows the full workflow | Four suggested replies walk through all four phases; the steps above the chat show the progress. |
 
+## Many callers at once
+
+The brief does not ask for this, but a harness that only works for one caller is a toy, so this
+is what happens under load, and what was measured. `README.md` → *Scaling and limits* has the
+detail.
+
+### What decides the capacity
+
+A turn is two to four calls to the model and takes 3–5 seconds. The harness's own work is a few
+milliseconds per turn. So the capacity is not about how fast the code is; it is about how many
+turns can wait for the model at the same time, and what the model account's rate limits allow.
+
+### What the server does about it
+
+- **Callers do not affect each other.** Each conversation has its own state. One turn at a time
+  per conversation; the turn works on a private copy that is saved only if the turn succeeds, so
+  a failed or refused turn leaves the conversation exactly as it was.
+- **It says "busy" instead of falling over.** At most 64 turns run at once per process. When all
+  are in use, a new message waits two seconds and is then told to come back
+  (`503` with `Retry-After`) rather than joining a queue that only grows. The UI retries by
+  itself. Health checks and reading a conversation never wait behind turns.
+- **Everything has an upper bound.** 4,000 characters per message, 16 KB per request,
+  60 messages per conversation (the 60th is answered by a handoff to a human), 50,000 open
+  conversations or 1 GB of state (the least recently used goes first), four hours idle, and an
+  optional limit per client.
+- **More processes can share the work.** Where conversations live is a small interface with two
+  implementations. In memory (the default) is for one process. A SQLite file is shared by several
+  worker processes or instances on one machine: any of them can answer any conversation, a
+  restart loses nothing, and a lease makes sure two processes never work on the same conversation
+  at once. Redis or Postgres would implement the same interface for several machines; that part
+  is described but not built.
+- **It can be watched.** `GET /api/stats` reports conversations held, turns in progress, how many
+  requests were refused and why, and turn latency. Each turn writes one log line without any
+  message text.
+
+### What was measured
+
+On one laptop, server and load generator on the same machine, with the offline stand-in for the
+model. `scripts/load_test.py` plays the callers and checks every conversation, not just status
+codes: each one must end where its script says, and no reply may contain another policyholder's
+claim.
+
+| Setup | Callers (at once) | Conversations correct | Result |
+|---|---|---|---|
+| One process, conversations in memory | 400 (100) | 400 of 400, in each of 7 runs | 116–162 turns/s |
+| Two instances sharing one SQLite file | 400 (100) | 400 of 400, in both runs | 172–224 turns/s; each conversation alternated between the two |
+| One instance, two worker processes | 400 (100) | 400 of 400 | 171 turns/s |
+| Model-like latency (about 3–4.5 s a turn), within the limit | 120 (60) | 120 of 120 | 13 turns/s, nothing refused |
+| Model-like latency, over the limit | 200 (150) | 200 of 200 | 16 turns/s; 304 messages were told to come back, and all were answered on retry |
+
+Also checked: eight messages sent at the same instant to one conversation are answered one at a
+time, in order; a conversation started on one instance was finished on another after the first
+was killed; with 33,000 conversations open, starting a conversation and answering a turn took
+the same time as with none (about 8 ms a turn; the previous version of the server took twice as
+long per turn there and started conversations at a quarter of the speed); malformed and oversized
+requests sent to a running server were refused cleanly and changed nothing.
+
+### So how many callers?
+
+With the live model, one process keeps 64 turns in flight, about 16 turns a second. A caller
+sends a message every 20–30 seconds, so that is roughly **300–400 callers in conversation at the
+same time per process**, provided the model account allows about 50 requests a second. More
+processes or instances raise that in proportion; in practice the model account's rate limit is
+the ceiling, not the harness. The numbers above with the offline stand-in show the harness is
+far from being the bottleneck.
+
+### What it still does not do
+
+- Run on several machines: that needs a networked store (Redis or Postgres) behind the same
+  interface.
+- Authenticate callers or apply global quotas: that belongs in a gateway in front. The built-in
+  rate limit is per instance.
+- Make model calls asynchronously: each turn in progress holds a thread.
+- The hosted demo is one small free instance with conversations in memory. It shows the
+  workflow; it is not sized for load.
+
 ## Run it locally
 
 ```bash
@@ -137,9 +213,14 @@ Then open <http://localhost:8000>.
 
 ## What was checked
 
-- **299 automated tests**, all offline. They include 150 random 30-turn conversations that feed
+- **508 automated tests**, all offline. They include 150 random 30-turn conversations that feed
   the engine arbitrary, even hostile, readings and assert after every turn that nothing behind
-  the gate was touched before verification.
+  the gate was touched before verification; malformed and extreme HTTP input (invalid JSON, wrong
+  types, control characters, oversized bodies, made-up conversation ids), which must never cause
+  a server error or change a conversation; and the behaviour under load described above (full
+  server, busy conversation, crashed worker, eviction, expiry).
+- **A load test** (`scripts/load_test.py`) that checks every simulated conversation; results in
+  *Many callers at once*.
 - **24 requirement checks** (`scripts/spec_check.py`), one per line of the brief. They pass
   against the offline stand-in, against the live model, and against the hosted demo.
 - **Ten scripted conversations against the live model** (`scripts/run_scenarios.py`).
@@ -148,8 +229,9 @@ Then open <http://localhost:8000>.
 
 ## Limits worth knowing
 
-- Email sending, the human handoff and the policyholder-consent service are simulated; sessions
-  are held in memory.
+- Email sending, the human handoff and the policyholder-consent service are simulated.
+- Conversations are held in memory by default (lost on restart); a SQLite file can be configured
+  instead. See *Many callers at once* for what is and is not there for scale.
 - The offline stand-in understands language crudely (regular expressions). It is there to show
   the control flow without a key; judge the conversation quality with the live model.
 - The UI was checked in desktop Chrome and at phone width.

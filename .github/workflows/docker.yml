@@ -2,7 +2,10 @@ name: docker
 
 # Builds the image exactly as the README describes, runs it, and walks the demo test case
 # through all four SOP phases over HTTP. No model API key is needed: the container is run in
-# offline mode (SOP_LLM_MODE=mock) and, separately, in model mode with no key at all.
+# offline mode (SOP_LLM_MODE=mock) and, separately, in model mode with no key at all. The load
+# test (scripts/load_test.py) then runs against one offline container, and against two
+# containers that share a SQLite session store on a volume, every conversation alternating
+# between them.
 
 on:
   push:
@@ -61,6 +64,9 @@ jobs:
       - name: Every requirement of the brief, one by one
         run: python3 scripts/spec_check.py http://127.0.0.1:8000
 
+      - name: Load test against the offline container (every conversation checked)
+        run: python3 scripts/load_test.py http://127.0.0.1:8000 --callers 300 --concurrency 60
+
       - name: Start a container in model mode without a key
         run: |
           docker run -d --name sop-nokey -p 8001:8000 sop-agent
@@ -87,6 +93,36 @@ jobs:
       - name: Auto mode answers offline when nobody supplies a key
         run: python3 scripts/spec_check.py http://127.0.0.1:8003
 
+      - name: Start two containers that share one SQLite session store (one runs two workers)
+        run: |
+          docker volume create sop-sessions
+          docker run -d --name sop-shared-a -p 8004:8000 -v sop-sessions:/data \
+            -e SOP_LLM_MODE=mock -e SOP_SESSION_STORE=/data/sessions.db sop-agent
+          docker run -d --name sop-shared-b -p 8005:8000 -v sop-sessions:/data \
+            -e SOP_LLM_MODE=mock -e SOP_SESSION_STORE=/data/sessions.db -e SOP_WORKERS=2 sop-agent
+          for port in 8004 8005; do
+            up=""
+            for i in $(seq 1 30); do
+              if curl -fsS "http://127.0.0.1:$port/healthz" > /dev/null 2>&1; then up=1; break; fi
+              sleep 1
+            done
+            if [ -z "$up" ]; then docker logs sop-shared-a; docker logs sop-shared-b; exit 1; fi
+          done
+
+      - name: Load test across both containers (each conversation alternates between them)
+        run: python3 scripts/load_test.py http://127.0.0.1:8004 http://127.0.0.1:8005 --callers 400 --concurrency 100
+
+      - name: The in-memory store refuses several workers
+        run: |
+          set +e
+          out=$(timeout 60 docker run --name sop-refused -e SOP_WORKERS=2 sop-agent 2>&1)
+          code=$?
+          set -e
+          docker rm -f sop-refused > /dev/null 2>&1 || true
+          echo "$out"
+          test "$code" = 2
+          echo "$out" | grep -q "SOP_SESSION_STORE=sqlite"
+
       - name: docker compose builds, starts and serves the same workflow
         env:
           SOP_LLM_MODE: mock
@@ -106,6 +142,8 @@ jobs:
           echo "--- offline mode ---"; docker logs sop-offline || true
           echo "--- model mode, no key ---"; docker logs sop-nokey || true
           echo "--- auto mode, no key ---"; docker logs sop-auto || true
+          echo "--- shared store, container A ---"; docker logs sop-shared-a || true
+          echo "--- shared store, container B (two workers) ---"; docker logs sop-shared-b || true
 
   tests:
     name: Test suite on the image's Python

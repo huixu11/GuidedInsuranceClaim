@@ -75,6 +75,13 @@ def _env_int(name: str, default: int) -> int:
         return default
 
 
+def _env_float(name: str, default: float) -> float:
+    try:
+        return float(_env(name, str(default)))
+    except ValueError:
+        return default
+
+
 def _env_bool(name: str, default: bool) -> bool:
     value = os.environ.get(name, "").strip().lower()
     if not value:
@@ -105,6 +112,22 @@ class Settings:
 
     history_window: int = 40
     session_ttl_seconds: int = 4 * 3600
+
+    # A conversation holds at most this many caller messages; the last one is answered by a
+    # handoff to a human (engine), anything after it is refused (server).
+    max_turns_per_conversation: int = 60
+
+    # Serving limits (server.py / store.py). The README section "Scaling and limits" explains them.
+    session_store: str = "memory"  # memory | sqlite:///path/sessions.db | a plain file path
+    max_sessions: int = 50_000  # conversations held; the least recently used is evicted
+    max_store_mb: int = 1024  # memory store: state held (JSON text); beyond it, eviction too (0 = off)
+    max_concurrent_turns: int = 64  # turns processed at once per process (turn slots)
+    turn_slot_wait_seconds: float = 2.0  # wait for a free slot before answering 503 server_busy
+    conversation_wait_seconds: float = 5.0  # wait for the same conversation's turn before 409
+    turn_lease_seconds: float = 300.0  # sqlite: a crashed worker's hold on a conversation expires
+    rate_limit_per_minute: int = 0  # turns per client per minute (0 = off); creation gets 1/4
+    trust_proxy: bool = False  # client = last X-Forwarded-For hop instead of the socket peer
+    mock_latency_ms: int = 0  # offline double: sleep this long in every model-call method
 
     def use_refusal_fallback(self, model: str) -> bool:
         if self.refusal_fallback == "off":
@@ -150,4 +173,18 @@ def load_settings() -> Settings:
         max_failed_attempts=max(1, _env_int("SOP_MAX_FAILED_ATTEMPTS", 3)),
         out_of_scope_limit=max(1, _env_int("SOP_OUT_OF_SCOPE_LIMIT", 3)),
         max_persuasion_attempts=max(1, _env_int("SOP_MAX_PERSUASION_ATTEMPTS", 2)),
+        session_ttl_seconds=max(60, _env_int("SOP_SESSION_TTL_SECONDS", 4 * 3600)),
+        max_turns_per_conversation=max(2, _env_int("SOP_MAX_TURNS_PER_CONVERSATION", 60)),
+        session_store=_env("SOP_SESSION_STORE", "memory"),
+        max_sessions=max(1, _env_int("SOP_MAX_SESSIONS", 50_000)),
+        max_store_mb=max(0, _env_int("SOP_MAX_STORE_MB", 1024)),
+        max_concurrent_turns=max(1, _env_int("SOP_MAX_CONCURRENT_TURNS", 64)),
+        turn_slot_wait_seconds=max(0.0, _env_float("SOP_TURN_SLOT_WAIT_SECONDS", 2.0)),
+        conversation_wait_seconds=max(0.0, _env_float("SOP_CONVERSATION_WAIT_SECONDS", 5.0)),
+        # Well above a turn's usual length (model calls time out after 120 s, retried twice); a
+        # turn that outlives its lease is not written, so nothing newer is overwritten.
+        turn_lease_seconds=max(10.0, _env_float("SOP_TURN_LEASE_SECONDS", 300.0)),
+        rate_limit_per_minute=max(0, _env_int("SOP_RATE_LIMIT_PER_MINUTE", 0)),
+        trust_proxy=_env_bool("SOP_TRUST_PROXY", False),
+        mock_latency_ms=max(0, _env_int("SOP_MOCK_LATENCY_MS", 0)),
     )

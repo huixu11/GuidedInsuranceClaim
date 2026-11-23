@@ -12,7 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 SKIP_DIRS = {".venv", "venv", "__pycache__", ".pytest_cache", ".git", ".claude", "node_modules"}
 SKIP_FILES = {".env"}
-SKIP_SUFFIXES = {".pyc", ".zip"}
+# .db*: a SQLite session store kept in the project folder holds whole conversations.
+SKIP_SUFFIXES = {".pyc", ".zip", ".db", ".db-wal", ".db-shm"}
 
 
 def main() -> None:

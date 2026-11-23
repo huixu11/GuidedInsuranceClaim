@@ -51,6 +51,11 @@ class Backend(policy.PolicyBackend, Protocol):
     ) -> Any: ...
 
 
+class ConversationClosed(Exception):
+    """The conversation already holds the maximum number of messages (its last one was answered
+    by a handoff to a human); nothing more is processed or stored."""
+
+
 def _llm_label(meta: dict[str, Any]) -> str:
     parts = [str(meta.get("call", "model call")), str(meta.get("model", ""))]
     if meta.get("ms") is not None:
@@ -77,9 +82,19 @@ class Agent:
         self, state: SessionState, user_text: str, backend: Backend
     ) -> tuple[str, dict[str, Any]]:
         """Process one caller message. Mutates `state`; callers pass a working copy and
-        commit it only if this returns (an LLMError means: discard the copy, nothing happened)."""
+        commit it only if this returns (an LLMError means: discard the copy, nothing happened).
+
+        A conversation holds at most `max_turns_per_conversation` messages: the last one is
+        answered by a handoff to a human without reading it, and any message after that raises
+        ConversationClosed before anything changes."""
         started = time.perf_counter()
         cfg = self.settings
+        limit = cfg.max_turns_per_conversation
+        if state.turn >= limit:
+            raise ConversationClosed(
+                f"This conversation has reached its limit of {limit} messages and was handed to "
+                "a human representative. Please start a new conversation."
+            )
         state.turn += 1
         trace = Trace(turn=state.turn, phase_before=state.phase.value)
         tools = Toolbox(self.repo, state, trace, cfg)
@@ -88,6 +103,13 @@ class Agent:
             state.messages.append({"role": "user", "text": user_text, "turn": state.turn})
             trace.add("gate", "conversation already handed to a human — no further processing", None)
             return self._finish(state, trace, replies.ESCALATED_NOTICE, started)
+
+        if state.turn >= limit:
+            # The last message one conversation may hold: close it with a handoff, the same
+            # way as the other handoffs, instead of letting it (and its cost) grow without end.
+            state.messages.append({"role": "user", "text": user_text, "turn": state.turn})
+            directive = policy.close_at_turn_limit(state, tools, backend, trace, cfg, self.repo)
+            return self._finish(state, trace, self._reply(state, directive, tools, backend, trace), started)
 
         # 1. Understand (the model reads; it decides nothing).
         try:

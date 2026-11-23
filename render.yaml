@@ -21,3 +21,10 @@ services:
       # The image listens on this port (HOST is already 0.0.0.0 in the Dockerfile).
       - key: PORT
         value: "8000"
+      # The free instance has 512 MB of memory and one small CPU share: keep what it holds well
+      # inside that. The defaults (50,000 conversations or 1 GB of state) suit a larger machine.
+      # One process, conversations in memory; see the README, "Scaling and limits".
+      - key: SOP_MAX_SESSIONS
+        value: "20000"
+      - key: SOP_MAX_STORE_MB
+        value: "128"
