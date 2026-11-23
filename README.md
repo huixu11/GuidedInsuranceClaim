@@ -384,13 +384,16 @@ stays up; only then does it show the error row with its Retry button.
 
 ### The arithmetic for live turns
 
-- **Turns per process.** A live turn takes typically 3–5 s (see above). With 64 slots one process
-  answers at most about 64 / 4 s ≈ 16 turns per second. A caller sends a message every 20–30 s
-  or so (reading, typing, waiting), so that is in the order of 400 callers in conversation at
-  once per process — provided the model API account allows ~16 turns × 3 calls ≈ 50 requests a
-  second and the tokens that go with them. In practice the account's rate limits are the first
-  ceiling: set `SOP_MAX_CONCURRENT_TURNS` to what the account sustains, and the server refuses
-  the rest cleanly instead of collecting the API's `429`s.
+- **Turns per process.** A live turn takes typically 3–5 s (see above): the median was 4.0 s
+  over the ten scripted scenarios, and 6.3 s for the demo conversation, whose answers are long
+  and drawn from the document guidance ([measured below](#with-the-live-model)). With 64 slots
+  one process therefore answers at most about 64 / 4 s ≈ 16 turns per second, or 64 / 6.3 s ≈ 10
+  when every turn is a long one. A caller sends a message every 20–30 s or so (reading, typing,
+  waiting), so that is in the order of 200–400 callers in conversation at once per process,
+  depending on what they ask — provided the model API account allows 10–16 turns × 2–3 calls
+  ≈ 25–50 requests a second and the tokens that go with them. In practice the account's rate
+  limits are the first ceiling: set `SOP_MAX_CONCURRENT_TURNS` to what the account sustains, and
+  the server refuses the rest cleanly instead of collecting the API's `429`s.
 - **Threads.** 64 turn threads plus the default pool of 40 for everything else, per process.
   Turns are I/O-bound, so the GIL is not the limit; CPU per turn is a few milliseconds.
 - **Memory.** The state of a conversation is kept as JSON: ~2 KB new, ~20 KB after a typical
@@ -398,7 +401,9 @@ stays up; only then does it show the error row with its Retry button.
   characters. 50,000 conversations of typical length are about 1 GB, so the memory store also
   keeps to `SOP_MAX_STORE_MB` (1,024 by default) and evicts the least recently used beyond it.
   Size both to the machine. `/api/stats` shows `state_bytes_held`.
-- **Cost.** The message cap bounds the model calls of one conversation to about 60 × 3.
+- **Cost.** The message cap bounds the model calls of one conversation to about 60 × 3. Measured
+  with the default models, the five-message demo conversation took 12 model calls and, as the
+  turn log counts them, about 16,000 input and 3,400 output tokens.
 
 ### Settings
 
@@ -471,7 +476,8 @@ right claim, email sent once or skipped, handed off), no reply names another pol
 claim, reading a conversation back gives what the last turn returned, and eight messages sent at
 the same instant to one conversation are all answered, one at a time. It honours `Retry-After`
 like a client would and exits non-zero if any conversation went wrong. It refuses to run against
-the live model.
+the live model; `scripts/live_check.py` is the small check for that
+([below](#with-the-live-model)).
 
 ```bash
 python -m insurance_claims --mock --port 8021 &
@@ -543,7 +549,54 @@ Two more checks, done by hand:
   the least recently used conversation is dropped: with a cap of 300, creating 500 more left 300
   held, and the oldest answered `404`.
 
+### With the live model
+
+`scripts/load_test.py` stays away from the live model, so `scripts/live_check.py` is the small
+version for it. N callers run the demo conversation at the same moment, four messages go to one
+conversation at the same instant, and, when the instance was started with a small message cap,
+one conversation is taken to the cap. The wording is the model's, so every conversation is
+checked on its state (verified, the right claim, phases in order, one email, the turn counter).
+
+```bash
+python -m insurance_claims --port 8000 &                 # live model, key from the environment
+python scripts/live_check.py http://127.0.0.1:8000       # 12 callers at once, about 65 live turns
+
+# two workers on one SQLite file, and a cap small enough to reach
+SOP_SESSION_STORE=/tmp/live.db SOP_MAX_TURNS_PER_CONVERSATION=7 python -m insurance_claims --workers 2 --port 8031 &
+python scripts/live_check.py http://127.0.0.1:8031 --callers 8
+```
+
+**Measured** on the same laptop with the default models (`claude-opus-5-5` for the replies,
+`claude-haiku-5-5` for the structured calls):
+
+| Setup | Conversations at once | Conversations correct | Live turns | Took (one after another) | Turn time p50 / p95 | Model errors / `429` |
+|---|---|---|---|---|---|---|
+| 1 process, memory store | 12 | 12 of 12 | 60 | 32 s (358 s) | 6.3 s / 7.9 s | 0 / 0 |
+| 1 instance, 2 workers, SQLite | 8 | 8 of 8 | 40 | 34 s (251 s) | 6.6 s / 8.0 s | 0 / 0 |
+
+- **Twelve at once were no slower per turn than one caller alone**: the same five messages sent
+  by a single caller took 6.5, 6.0, 7.2, 3.2 and 7.1 s. The time is the model's.
+- **Four messages at the same instant to one conversation** were answered as turns 2, 3, 4 and 5,
+  none lost, in about 25 s in both setups. A live turn takes longer than
+  `SOP_CONVERSATION_WAIT_SECONDS`, so the waiting messages were told `409 conversation_busy` six
+  times in all and were answered on retry.
+- **With two workers, both answered** (21 and 31 turns). A conversation's messages went to
+  either of them, through the SQLite file.
+- **With a cap of 7**, the seventh message was answered by the handoff to a human and the eighth
+  with `409 conversation_closed`, which left the conversation as it was.
+- The same day, the 24 requirement checks (`scripts/spec_check.py`) and the ten scripted
+  scenarios (`scripts/run_scenarios.py`; 38 turns, median 4.0 s, p95 7.1 s) passed against the
+  live model.
+
+This checks that the server stays correct with several callers and the real model. It is not a
+load test: it went to 12 conversations at once, not to the 64 slots, so the capacity in
+[the arithmetic](#the-arithmetic-for-live-turns) is worked out from these turn times, not
+measured at the limit.
+
 ### What is not here, and would be for production
+
+- **A load test with the live model up to the turn slots.** It would spend real credit and meet
+  the account's rate limits first; the offline double with `SOP_MOCK_LATENCY_MS` stands in for it.
 
 - **A networked session store** (Redis or Postgres) for instances on several machines. The
   interface is small and the record is plain JSON (`store.py` says how the lease maps onto each);
@@ -567,6 +620,7 @@ pip install -r requirements-dev.txt
 pytest                                   # offline, no key needed
 python scripts/run_scenarios.py          # scripted conversations against the live model
 SOP_LLM_MODE=mock python scripts/run_scenarios.py demo frustrated   # same, offline
+python scripts/live_check.py http://127.0.0.1:8000   # several callers at once, live instance
 ```
 
 The suite runs without a model:
@@ -611,6 +665,8 @@ The suite runs without a model:
 `scripts/run_scenarios.py` is the live check: it plays ten scripted conversations (demo case,
 memory, frustration, refusal, mismatches, off-topic, representative, consent timeout, ambiguity,
 human request) against the real model and prints each reply with the harness decisions behind it.
+`scripts/live_check.py` does the same for several callers at once against a running instance
+([With the live model](#with-the-live-model)).
 
 ### Checking the Docker image
 
@@ -669,6 +725,7 @@ scripts/run_scenarios.py     scripted conversations against the live model (or o
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
 scripts/spec_check.py        the brief, requirement by requirement, against an offline instance
 scripts/load_test.py         many simulated callers against running instances, each conversation checked
+scripts/live_check.py        several callers at once against an instance on the live model
 .github/workflows/docker.yml image build + container checks + test suite on Linux
 tests/
 ```

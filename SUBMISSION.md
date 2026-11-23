@@ -115,8 +115,9 @@ detail.
 
 ### What decides the capacity
 
-A turn is two to four calls to the model and takes 3–5 seconds. The harness's own work is a few
-milliseconds per turn. So the capacity is not about how fast the code is; it is about how many
+A turn is two to four calls to the model and takes 3–7 seconds (measured: 4 seconds at the
+median over the scripted scenarios, 6.3 for the long answers of the demo conversation). The
+harness's own work is a few milliseconds per turn. So the capacity is not about how fast the code is; it is about how many
 turns can wait for the model at the same time, and what the model account's rate limits allow.
 
 ### What the server does about it
@@ -164,14 +165,30 @@ the same time as with none (about 8 ms a turn; the previous version of the serve
 long per turn there and started conversations at a quarter of the speed); malformed and oversized
 requests sent to a running server were refused cleanly and changed nothing.
 
+**With the live model** (`scripts/live_check.py`, same laptop, default models), a smaller check,
+because every turn costs credit:
+
+| Setup | Conversations at once | Conversations correct | Result |
+|---|---|---|---|
+| One process, conversations in memory | 12 | 12 of 12 | 60 turns in 32 s (358 s one after another); 6.3 s a turn at the median, the same as one caller alone |
+| One instance, two worker processes, SQLite | 8 | 8 of 8 | 40 turns in 34 s; both workers answered |
+
+No model errors and no rate limiting in either. Four messages sent at the same instant to one
+conversation were answered one at a time, none lost. A conversation taken to its message cap was
+handed to a human and then closed.
+
 ### So how many callers?
 
-With the live model, one process keeps 64 turns in flight, about 16 turns a second. A caller
-sends a message every 20–30 seconds, so that is roughly **300–400 callers in conversation at the
-same time per process**, provided the model account allows about 50 requests a second. More
-processes or instances raise that in proportion; in practice the model account's rate limit is
-the ceiling, not the harness. The numbers above with the offline stand-in show the harness is
-far from being the bottleneck.
+With the live model, one process keeps 64 turns in flight. At the measured 4 to 6.3 seconds a
+turn that is 10–16 turns a second. A caller sends a message every 20–30 seconds, so that is
+roughly **200–400 callers in conversation at the same time per process**, depending on how long
+the answers are, provided the model account allows about 25–50 requests a second. More processes
+or instances raise that in proportion; in practice the model account's rate limit is the
+ceiling, not the harness. The numbers above with the offline stand-in show the harness is far
+from being the bottleneck.
+
+That figure is worked out from measured turn times. The live check went to 12 conversations at
+once, not to the limit: a live load test up to 64 turns in flight was not run.
 
 ### What it still does not do
 
@@ -224,8 +241,11 @@ Then open <http://localhost:8000>.
 - **24 requirement checks** (`scripts/spec_check.py`), one per line of the brief. They pass
   against the offline stand-in, against the live model, and against the hosted demo.
 - **Ten scripted conversations against the live model** (`scripts/run_scenarios.py`).
+- **Several callers at once against the live model** (`scripts/live_check.py`); results in
+  *Many callers at once*.
 - **CI on every push** (GitHub Actions): builds the Docker image, runs it, plays the demo case
-  through it, and runs the test suite on the image's Python.
+  through it, load-tests it (one container, then two sharing a SQLite store), and runs the test
+  suite on the image's Python.
 
 ## Limits worth knowing
 
