@@ -510,7 +510,12 @@ Messages API, a few seconds in all. The server is built around that:
 | `409` | `conversation_busy` | The same conversation is mid-turn beyond the wait | `1` | retries by itself |
 | `409` | `conversation_closed` | The message cap was reached earlier | — | error row, no retry |
 | `409` | `message_id_reused` | The `message_id` was already used for a different text in this conversation | — | error row, no retry |
-| `404` | `session_not_found` | Never created, expired, or evicted to make room | — | offers a new conversation |
+| `404` | `session_not_found` | Never created, expired, evicted to make room, or the server restarted with the memory store | — | if nothing had been answered yet, starts a new conversation and sends the message there; otherwise keeps the transcript, offers a new conversation and carries the unsent text into it |
+
+The conversation is looked up before the model is called. So a message to a conversation the
+server no longer has is answered `404 session_not_found` whatever key came with it; whether a
+key is valid is only known once the model service has been asked, and that answer is
+`401 invalid_api_key`.
 
 Every one uses the error envelope `{"error": {"code", "message"}}` and changes nothing. The UI
 retries a busy answer up to three times, honouring `Retry-After`, while the typing indicator

@@ -19,7 +19,8 @@ configuration and test details.
 About the hosted demo:
 
 - It is on a free plan that sleeps after 15 minutes without traffic, so **the first load can take
-  about a minute**.
+  about a minute**. It keeps conversations in memory, so a conversation left open across such a
+  sleep is gone when it wakes up: the page says so and starts a new one.
 - **Without a key** it answers with an offline stand-in for the model (fixed, stilted replies).
   That is enough to click through the whole workflow.
 - **With your own Anthropic API key** it uses the live model: open **Settings** (the line under

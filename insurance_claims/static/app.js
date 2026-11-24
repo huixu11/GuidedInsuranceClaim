@@ -75,7 +75,7 @@
     rate_limited: 'Rate limited',
     llm_error: 'Model error',
     bad_request: 'Request rejected',
-    session_not_found: 'Conversation not found',
+    session_not_found: 'The server no longer has this conversation',
     conversation_busy: 'Still answering',
     server_busy: 'Server busy',
     payload_too_large: 'Message too large',
@@ -197,6 +197,8 @@
     sessionController: null,
     failed: null, // { text, row, retryBtn, userRow, messageId } for the latest failed message
     sessionLost: false,
+    lostDraft: '', // the message that could not be sent to a conversation the server no longer has
+    lostRecovered: false, // such a conversation was just replaced automatically; not twice in a row
     keyError: '', // code of the last API-key error, until a key is saved or a turn succeeds
     activeTab: 'chat', // narrow screens: chat | inspector
     view: 'overview', // SOP state tab: overview | trace | json
@@ -1816,7 +1818,8 @@
     let node = null;
     if (app.sessionLost) {
       node = statusNote('bad', 'alert',
-        'This conversation no longer exists on the server (it expired, made room for newer ones, or the server restarted).', true);
+        'The server no longer has this conversation: it restarted, or the conversation expired or made room for newer ones. '
+        + 'Start a new one; your unsent message will be waiting in the message box.', true);
     } else if (app.state && status === 'escalated') {
       node = statusNote('warn', 'user', 'Transferred to a human representative. This virtual session has ended.', true);
     } else if (app.state && status === 'completed') {
@@ -1947,6 +1950,7 @@
     app.pending = false;
     showTyping(false);
     updateComposerState();
+    if (!error || error.code !== 'session_not_found') app.lostRecovered = false;
 
     if (error) {
       handleSendError(error, text, userRow, messageId);
@@ -2002,7 +2006,17 @@
   function handleSendError(err, text, userRow, messageId) {
     if (err.code === 'aborted') return;
     if (err.code === 'session_not_found') {
+      // The server no longer has this conversation: it restarted with its conversations in
+      // memory, or the conversation expired. If nothing had been answered in it yet, nothing is
+      // lost: start a new conversation and send the message there. Otherwise the transcript
+      // stays on screen and the unsent text is carried into the conversation the user starts.
+      if (!app.userTurns.length && !app.lostRecovered) {
+        app.lostRecovered = true;
+        startSession({ lost: true, send: text });
+        return;
+      }
       app.sessionLost = true;
+      app.lostDraft = text;
       showFailedRow(text, err, false, userRow);
       updateStatusUi();
       scrollChatToBottom(); // the note was added after the error row
@@ -2123,6 +2137,7 @@
     app.open.clear();
     app.failed = null;
     app.sessionLost = false;
+    app.lostDraft = '';
     app.pending = false;
     app.userTurns = [];
     app.suggestKey = null;
@@ -2149,11 +2164,24 @@
       .join(' · ');
   }
 
-  async function startSession() {
+  // Put back in the message box a message that could not be sent, without sending it.
+  function offerDraft(text) {
+    if (!text || dom.input.value.trim()) return;
+    dom.input.value = text;
+    autoGrow();
+    updateComposerState();
+  }
+
+  // `opts.lost`: this replaces a conversation the server no longer has. `opts.send`: a message
+  // to send as soon as the new conversation is there (the one the lost conversation never got).
+  async function startSession(opts) {
     if (!app.configLoaded) {
       loadConfig();
       return;
     }
+    const lost = Boolean(opts && opts.lost);
+    const send = opts && opts.send ? String(opts.send) : '';
+    const draft = send || app.lostDraft; // read before the reset below forgets it
     abortInFlight();
     app.gen += 1;
     const gen = app.gen;
@@ -2192,11 +2220,15 @@
       }
       renderInspector();
       updateStatusUi();
+      offerDraft(draft); // not lost: it is there when a conversation does start
       return;
     }
 
-    presentConversation(data, scenario, sessionDividerText('New conversation', scenario, clockTime()));
+    const lead = lost ? 'Conversation restarted (the server no longer had the previous one)' : 'New conversation';
+    presentConversation(data, scenario, sessionDividerText(lead, scenario, clockTime()));
     if (app.sessionId) clearUrlSession(); // the address no longer names the conversation shown
+    if (send && canSend() && !app.pending) sendMessage(send, false);
+    else offerDraft(draft);
   }
 
   // Reopen a conversation the server still has (after a reload, or from ?session=<id>).
