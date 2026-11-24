@@ -818,8 +818,8 @@ and delivery rework):
   `test_llm_resilience.py`.
 
 Not run again on this version: the same check with two worker processes on one SQLite file
-(8 of 8 on 2026-11-22, on the previous version), and the requirement checks against the hosted
-demo.
+(8 of 8 on 2026-11-22, on the previous version). The hosted demo runs this version too; with no
+key supplied it answers offline, and the 24 requirement checks pass against it.
 
 This checks that the server stays correct with several callers and the real model. It is not a
 load test: it went to 12 conversations at once, not to the 64 slots, so the capacity in

@@ -295,8 +295,8 @@ docker kill sop-ha-app2-1
 - **24 requirement checks** (`scripts/spec_check.py`), one per line of the brief. All 24 pass
   against the offline stand-in. Against the live model 23 passed as written; the 24th failed on
   its keyword list, not on the behaviour: the agent explained why it verifies in words the list
-  did not have (the list was widened afterwards). On the previous version they also passed
-  against the hosted demo.
+  did not have (the list was widened afterwards). All 24 also pass against the hosted demo,
+  which runs this version and answers offline when no key is supplied.
 - **Against the live model, on this version**: ten scripted conversations
   (`scripts/run_scenarios.py`), twelve callers at once (`scripts/live_check.py`) and an instance
   killed in the middle of live turns (`scripts/failover_test.py`); results in *Many callers, and
