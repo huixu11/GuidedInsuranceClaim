@@ -1,0 +1,88 @@
+# Three stateless instances behind a load balancer, on one PostgreSQL database.
+#
+#   docker compose -f docker-compose.ha.yml up --build --wait      # then open http://localhost:8080
+#   docker kill sop-ha-app2-1                                      # an instance dies: nothing is lost
+#   docker start sop-ha-app2-1                                     # it rejoins by itself
+#
+# What this shows (README, "Failure and recovery"): no instance holds anything a conversation
+# needs. A conversation's turns may be answered by any instance; an instance that dies takes
+# nothing with it; a message that was in flight is retried by the client with the same
+# message_id and answered once. The load balancer sends traffic only to instances whose /readyz
+# answers, and moves a request it could not hand over to another instance.
+#
+# What it does not show: the database here is ONE container, so it is the single point of
+# failure of this file. In production it is a managed PostgreSQL with a standby and automatic
+# failover (the application reconnects by itself and answers 503 with Retry-After meanwhile),
+# and the load balancer is the platform's (which has more than one node). See the README.
+name: sop-ha
+
+x-app: &app
+  build: .
+  image: sop-agent
+  environment:
+    # Model API auth token. Empty: testers paste a key in the UI, or the offline double answers.
+    ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+    SOP_LLM_MODE: ${SOP_LLM_MODE:-auto}
+    # Every instance uses the same database: conversations, their audit trail and the queue of
+    # e-mails and handoffs to deliver.
+    SOP_SESSION_STORE: postgresql://sop:${POSTGRES_PASSWORD:-sop-demo-only}@db:5432/sop
+    # Connections per instance; instances x this must stay below the database's max_connections.
+    SOP_STORE_POOL_SIZE: ${SOP_STORE_POOL_SIZE:-20}
+    # 32 random bytes (base64) encrypt transcripts, state and queued e-mails at rest; empty = off.
+    SOP_DATA_KEY: ${SOP_DATA_KEY:-}
+    # The client's address is what the load balancer saw (for the per-client rate limit).
+    SOP_TRUST_PROXY: "1"
+    SOP_RATE_LIMIT_PER_MINUTE: ${SOP_RATE_LIMIT_PER_MINUTE:-}
+    SOP_MOCK_LATENCY_MS: ${SOP_MOCK_LATENCY_MS:-}
+    SOP_TURN_LEASE_SECONDS: ${SOP_TURN_LEASE_SECONDS:-}
+  depends_on:
+    db:
+      condition: service_healthy
+  # Readiness, not liveness: an instance that cannot reach the database takes no traffic.
+  healthcheck:
+    test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/readyz', timeout=3)"]
+    interval: 5s
+    timeout: 5s
+    retries: 3
+    start_period: 15s
+  # Longer than SOP_SHUTDOWN_GRACE_SECONDS (30): a stopping instance finishes the turns it has.
+  stop_grace_period: 40s
+  restart: unless-stopped
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: sop
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-sop-demo-only}
+      POSTGRES_DB: sop
+    volumes:
+      - sop-pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U sop -d sop"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    restart: unless-stopped
+
+  app1: *app
+  app2: *app
+  app3: *app
+
+  lb:
+    image: caddy:2-alpine
+    ports:
+      - "${PORT:-8080}:8080"
+    volumes:
+      - ./deploy/Caddyfile:/etc/caddy/Caddyfile:ro
+    depends_on:
+      app1:
+        condition: service_healthy
+      app2:
+        condition: service_healthy
+      app3:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  sop-pgdata:

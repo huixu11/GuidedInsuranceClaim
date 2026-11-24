@@ -204,7 +204,7 @@ def _core(d: P.Directive, state: SessionState, settings: Settings) -> str:
         # Fixed wording uses only text built from the records, never the model-drafted summary.
         step = f.get("next_step_from_records")
         return (
-            f"Done — I've sent the summary to {f['sent_to']}."
+            f"Done — the summary is on its way to {f['sent_to']}."
             + (f" The main next step: {step}" if step else "")
             + f" Thanks for contacting {COMPANY_NAME}, and take care."
         )

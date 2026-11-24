@@ -1,12 +1,19 @@
-"""Session stores: one contract, two implementations (MemoryStore, SqliteStore).
+"""Session stores: one contract, three implementations (MemoryStore, SqliteStore, PostgresStore).
 
-Every test in the first part runs against both stores. The SQLite-only part covers what only a
-store shared between processes has: two store objects on one file, a lease that lapses after a
-crash, and a second operating-system process holding a conversation.
+Every test in the first part runs against all three stores. The second part covers what only a
+store shared between processes has (SQLite and PostgreSQL): two store objects on one file or
+database, a lease that lapses after a crash, and a second operating-system process holding a
+conversation. PostgreSQL comes from SOP_TEST_POSTGRES_URL or an embedded server (conftest.py);
+without either, its cases are skipped with the reason.
+
+More: test_store_split.py (rows of their own, deletion and retention), test_store_effects.py (the
+outbox), test_store_leases.py (renewal and its limit), test_store_crypto.py (encryption at rest),
+test_store_postgres.py (outages, the pool, the password).
 """
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import subprocess
 import sys
@@ -22,6 +29,7 @@ from insurance_claims.state import MemoryItem, Phase, SessionState
 from insurance_claims.store import (
     ConversationBusy,
     MemoryStore,
+    PostgresStore,
     SessionNotFound,
     SqliteStore,
     StoreError,
@@ -30,6 +38,7 @@ from insurance_claims.store import (
 )
 
 PROJECT_DIR = Path(__file__).resolve().parent.parent
+SHARED = pytest.mark.parametrize("store_kind", ["sqlite", "postgres"], indirect=True)
 
 
 class FakeClock:
@@ -91,36 +100,21 @@ def rich_state() -> SessionState:
     s.traces = [{"turn": 1, "phase_before": "VERIFY_ID", "phase_after": "PROCESS_CASE", "latency_ms": 3,
                  "events": [{"kind": "llm", "label": "understand", "detail": {"input_tokens": 12, "x": [1, 2.5, None]}}]}]
     s.grounding = ['{"case_id": "CL-2048"}']
+    s.audit("identity_verified", party_id="P9", matched_fields=["full_name", "dob", "id_last4"])
+    s.audit("phase_changed", **{"from": "VERIFY_ID", "to": "RESOLVE_INTENT", "reason": "identity verified"})
     return s
 
 
-@pytest.fixture(params=["memory", "sqlite"])
-def kind(request):
-    return request.param
+@pytest.fixture()
+def kind(store_kind):
+    return store_kind
 
 
 @pytest.fixture()
-def make_store(kind, tmp_path):
-    """make_store(**options) -> a store of the parametrised kind; SQLite ones share one file."""
-    made = []
-
-    def make(clock: FakeClock | None = None, **options):
-        clock = clock or FakeClock()
-        options.setdefault("ttl_seconds", 100)
-        options.setdefault("max_sessions", 1000)
-        options.setdefault("wait_seconds", 0.2)
-        if kind == "memory":
-            store = MemoryStore(clock=clock, **options)
-        else:
-            options.setdefault("lease_seconds", 30)
-            store = SqliteStore(tmp_path / "sessions.db", clock=clock, **options)
-        store.test_clock = clock  # type: ignore[attr-defined]
-        made.append(store)
-        return store
-
-    yield make
-    for store in made:
-        store.close()  # so the temporary SQLite files can be deleted (Windows keeps open files)
+def make_store(store_factory):
+    """make_store(clock=None, **options) -> a store of the parametrised kind (memory, sqlite,
+    postgres); the SQL ones of one test share one file or database (conftest.store_factory)."""
+    return store_factory
 
 
 # ---------------------------------------------------------------------------
@@ -142,15 +136,31 @@ def test_record_defaults_and_none_survive():
     assert SessionState.from_record(json.loads(json.dumps(s.to_record()))) == s
 
 
-def test_record_refuses_what_it_cannot_keep():
+def test_record_from_an_older_or_newer_version_of_the_code():
     record = new_state().to_record()
-    with pytest.raises(ValueError, match="unknown fields"):
-        SessionState.from_record({**record, "added_by_a_newer_version": 1})
+    # A field this version does not know (written by a newer one, mid-deployment) is carried
+    # along and written back unchanged, not refused and not lost.
+    newer = {**record, "added_by_a_newer_version": {"n": 1}}
+    loaded = SessionState.from_record(newer)
+    assert loaded.unknown_fields == {"added_by_a_newer_version": {"n": 1}}
+    assert loaded.to_record() == newer
+    assert "unknown_fields" not in loaded.to_record()
+    # A different format marks a change old code must not guess at.
     with pytest.raises(ValueError, match="format"):
         SessionState.from_record({**record, "format": 99})
     # A field added later (absent from an older record) takes its default.
     record.pop("guard_blocks")
     assert SessionState.from_record(record).guard_blocks == 0
+
+
+def test_audit_events_are_numbered_and_survive_the_record():
+    s = new_state()
+    s.turn = 3
+    s.audit("identity_verified", party_id="P-1", matched_fields=["full_name", "dob", "id_last4"])
+    s.audit("phase_changed", **{"from": "VERIFY_ID", "to": "RESOLVE_INTENT"})
+    assert [e["seq"] for e in s.events] == [0, 1] and {e["turn"] for e in s.events} == {3}
+    assert s.events[0]["type"] == "identity_verified" and s.events[0]["data"]["party_id"] == "P-1"
+    assert SessionState.from_record(json.loads(json.dumps(s.to_record()))) == s
 
 
 class _Settings:
@@ -161,7 +171,7 @@ class _Settings:
 
 
 # ---------------------------------------------------------------------------
-# The contract, for both stores
+# The contract, for every store
 # ---------------------------------------------------------------------------
 def test_create_then_read_gives_an_equal_private_copy(make_store):
     store = make_store()
@@ -206,13 +216,32 @@ def test_a_turn_commits_and_a_failed_turn_writes_nothing(make_store):
             t.commit()  # once
 
 
+def test_a_turn_round_trips_every_field(make_store):
+    store = make_store()
+    s = new_state()
+    store.create(s)
+    rich = rich_state()
+    with store.turn(s.session_id) as t:
+        for f in dataclasses.fields(SessionState):
+            if f.name not in ("session_id", "messages"):
+                setattr(t.state, f.name, getattr(rich, f.name))
+        t.state.messages.extend(rich.messages[1:])
+        t.commit()
+    expected = dataclasses.replace(rich, session_id=s.session_id)
+    assert store.read(s.session_id) == expected
+    with store.turn(s.session_id) as t:
+        assert t.state == expected
+
+
 def test_a_read_during_a_turn_sees_the_last_commit(make_store):
     store = make_store()
     s = new_state()
     store.create(s)
     with store.turn(s.session_id) as t:
         t.state.turn = 5
+        t.state.messages.append({"role": "user", "text": "in progress", "turn": 5})
         assert store.read(s.session_id).turn == 0
+        assert len(store.read(s.session_id).messages) == 1
         t.commit()
     assert store.read(s.session_id).turn == 5
 
@@ -226,6 +255,7 @@ def test_an_unknown_conversation_is_not_found_at_once(make_store):
         with store.turn("does-not-exist"):
             pass
     assert time.monotonic() - started < 1  # no waiting for something that does not exist
+    assert store.audit("does-not-exist") == [] and store.effects("does-not-exist") == []
 
 
 def test_idle_conversations_expire_on_read_and_on_turn(make_store):
@@ -391,26 +421,28 @@ def test_stats_describe_the_store_without_content(make_store, kind):
     store.create(s)
     stats = store.stats()
     assert stats["kind"] == kind and stats["sessions_held"] == 1 and stats["turns_in_progress"] == 0
-    assert stats["shared_between_processes"] is (kind == "sqlite")
+    assert stats["shared_between_processes"] is (kind != "memory")
+    assert stats["effects"] == {"pending": 0, "sent": 0, "dead": 0}
     blob = json.dumps(stats)
     assert s.session_id not in blob and "Margaret" not in blob
+    store.ping()
+    assert kind in store.describe()
 
 
 # ---------------------------------------------------------------------------
-# SQLite only: shared between store objects and processes
+# SQLite and PostgreSQL: shared between store objects and processes
 # ---------------------------------------------------------------------------
 @pytest.fixture()
-def sqlite_pair(tmp_path):
+def shared_pair(store_factory):
     clock = FakeClock()
-    a = SqliteStore(tmp_path / "shared.db", ttl_seconds=1000, wait_seconds=0.2, lease_seconds=30, clock=clock)
-    b = SqliteStore(tmp_path / "shared.db", ttl_seconds=1000, wait_seconds=0.2, lease_seconds=30, clock=clock)
-    yield a, b, clock
-    a.close()
-    b.close()
+    a = store_factory(clock, ttl_seconds=1000, wait_seconds=0.2, lease_seconds=30)
+    b = store_factory(clock, ttl_seconds=1000, wait_seconds=0.2, lease_seconds=30)
+    return a, b, clock
 
 
-def test_two_store_objects_on_one_file_see_each_others_commits(sqlite_pair):
-    a, b, _ = sqlite_pair
+@SHARED
+def test_two_store_objects_on_one_file_see_each_others_commits(shared_pair):
+    a, b, _ = shared_pair
     s = new_state()
     a.create(s)
     assert b.read(s.session_id) == s
@@ -431,12 +463,13 @@ def test_two_store_objects_on_one_file_see_each_others_commits(sqlite_pair):
     assert a.stats()["sessions_held"] == b.stats()["sessions_held"] == 1
 
 
-def test_a_crashed_workers_lease_lapses_and_its_late_commit_is_refused(sqlite_pair):
-    a, b, clock = sqlite_pair
+@SHARED
+def test_a_crashed_workers_lease_lapses_and_its_late_commit_is_refused(shared_pair):
+    a, b, clock = shared_pair
     s = new_state()
     a.create(s)
     crashed = a.turn(s.session_id)
-    stuck = crashed.__enter__()  # took the conversation, then never came back
+    stuck = crashed.__enter__()  # took the conversation, then never came back (nor renewed it)
     with pytest.raises(ConversationBusy):
         with b.turn(s.session_id, wait=0.1):
             pass
@@ -445,16 +478,18 @@ def test_a_crashed_workers_lease_lapses_and_its_late_commit_is_refused(sqlite_pa
         t.state.turn = 7
         t.commit()
     stuck.state.turn = 99
+    stuck.state.messages.append({"role": "user", "text": "late", "turn": 99})
     with pytest.raises(ConversationBusy):
         stuck.commit()  # it would overwrite newer state, so nothing is written
     crashed.__exit__(None, None, None)  # releasing a lapsed lease does not disturb anyone
-    assert a.read(s.session_id).turn == 7
+    assert a.read(s.session_id).turn == 7 and len(a.read(s.session_id).messages) == 1
     with b.turn(s.session_id, wait=0) as t:
         assert t.state.turn == 7
 
 
-def test_the_cap_and_expiry_are_shared_by_every_store_on_the_file(sqlite_pair):
-    a, b, clock = sqlite_pair
+@SHARED
+def test_the_cap_and_expiry_are_shared_by_every_store_on_the_file(shared_pair):
+    a, b, clock = shared_pair
     a.max_sessions = b.max_sessions = 2
     first, second, third = new_state(), new_state(), new_state()
     a.create(first)
@@ -470,27 +505,36 @@ def test_the_cap_and_expiry_are_shared_by_every_store_on_the_file(sqlite_pair):
         a.read(third.session_id)
 
 
-def test_another_process_holding_a_conversation_is_waited_for(tmp_path):
-    path = tmp_path / "processes.db"
-    store = SqliteStore(path, wait_seconds=0.2)
+_HOLDER = textwrap.dedent(
+    """
+    import sys, time
+    from insurance_claims.store import PostgresStore, SqliteStore
+    kind, where, session_id = sys.argv[1:4]
+    store = SqliteStore(where) if kind == "sqlite" else PostgresStore(where)
+    with store.turn(session_id) as t:
+        print("holding", flush=True)
+        time.sleep(1.0)
+        t.state.turn += 1
+        t.state.messages.append({"role": "user", "text": "from the other process", "turn": t.state.turn})
+        t.commit()
+    store.close()
+    print("done", flush=True)
+    """
+)
+
+
+@SHARED
+def test_another_process_holding_a_conversation_is_waited_for(store_kind, request, tmp_path):
+    where = str(tmp_path / "processes.db") if store_kind == "sqlite" else request.getfixturevalue("postgres_url")
+
+    def open_it():
+        return SqliteStore(where, wait_seconds=0.2) if store_kind == "sqlite" else PostgresStore(where, wait_seconds=0.2)
+
+    store = open_it()
     s = new_state()
     store.create(s)
-    script = textwrap.dedent(
-        """
-        import sys, time
-        from insurance_claims.store import SqliteStore
-        store = SqliteStore(sys.argv[1])
-        with store.turn(sys.argv[2]) as t:
-            print("holding", flush=True)
-            time.sleep(1.0)
-            t.state.turn += 1
-            t.commit()
-        store.close()
-        print("done", flush=True)
-        """
-    )
     proc = subprocess.Popen(
-        [sys.executable, "-c", script, str(path), s.session_id],
+        [sys.executable, "-c", _HOLDER, store_kind, where, s.session_id],
         cwd=PROJECT_DIR,
         stdout=subprocess.PIPE,
         text=True,
@@ -510,9 +554,10 @@ def test_another_process_holding_a_conversation_is_waited_for(tmp_path):
             proc.kill()
         proc.stdout.close()
         store.close()
-    reopened = SqliteStore(path)
+    reopened = open_it()
     try:
-        assert reopened.read(s.session_id).turn == 2  # and it is all still there after a restart
+        back = reopened.read(s.session_id)  # and it is all still there after a restart
+        assert back.turn == 2 and back.messages[-1]["text"] == "from the other process"
     finally:
         reopened.close()
 
@@ -529,28 +574,77 @@ def test_another_process_holding_a_conversation_is_waited_for(tmp_path):
     ("sqlite:///C:/data/sessions.db", ("sqlite", "C:/data/sessions.db")),
     ("/data/sessions.db", ("sqlite", "/data/sessions.db")),
     (r"C:\data\sessions.db", ("sqlite", r"C:\data\sessions.db")),
+    ("postgresql://app:pw@db:5432/claims", ("postgres", "postgresql://app:pw@db:5432/claims")),
+    ("postgres://db/claims?sslmode=require", ("postgres", "postgres://db/claims?sslmode=require")),
+    (" PostgreSQL://db/claims ", ("postgres", "PostgreSQL://db/claims")),
 ])
 def test_store_setting_is_parsed(spec, expected):
     assert parse_store_spec(spec) == expected
 
 
-@pytest.mark.parametrize("spec", ["redis://localhost:6379", "postgres://db/x", "sqlite://x.db", ":memory:", "sqlite:///:memory:"])
+@pytest.mark.parametrize("spec", [
+    "redis://localhost:6379",
+    "redis://:hunter2-secret@cache:6379",
+    "postgresql+psycopg://app:hunter2-secret@db/claims",
+    "mysql://app:hunter2-secret@db/claims",
+    "sqlite://x.db",
+    ":memory:",
+    "sqlite:///:memory:",
+])
 def test_store_setting_refuses_what_it_cannot_serve(spec):
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as refused:
         parse_store_spec(spec)
+    assert "hunter2-secret" not in str(refused.value)
+
+
+def test_settings_never_show_the_store_url_or_the_data_key():
+    from insurance_claims.config import load_settings
+
+    cfg = dataclasses.replace(
+        load_settings(), session_store="postgresql://app:hunter2-secret@db/claims", data_key="k" * 44
+    )
+    assert "hunter2-secret" not in repr(cfg) and "k" * 44 not in repr(cfg)
 
 
 def test_open_store_follows_the_settings(tmp_path):
-    import dataclasses
-
     from insurance_claims.config import load_settings
 
     cfg = load_settings()
+    assert cfg.turn_lease_seconds == 20 and cfg.turn_max_seconds == 300
+    assert cfg.audit_retention_seconds == 90 * 86400 and cfg.store_pool_size == 20 and cfg.data_key == ""
     memory = open_store(dataclasses.replace(cfg, session_store="memory", max_sessions=7, max_store_mb=3))
     assert isinstance(memory, MemoryStore) and memory.max_sessions == 7 and memory.max_bytes == 3 * 1024 * 1024
-    sqlite = open_store(dataclasses.replace(cfg, session_store=str(tmp_path / "sub" / "s.db")))
+    sqlite = open_store(
+        dataclasses.replace(
+            cfg,
+            session_store=str(tmp_path / "sub" / "s.db"),
+            turn_lease_seconds=12,
+            turn_max_seconds=90,
+            audit_retention_seconds=3600,
+        )
+    )
     try:
-        assert isinstance(sqlite, SqliteStore) and sqlite.lease_seconds == cfg.turn_lease_seconds
+        assert isinstance(sqlite, SqliteStore) and sqlite.lease_seconds == 12
+        assert sqlite.turn_max_seconds == 90 and sqlite.audit_retention_seconds == 3600
+        assert not sqlite.encrypted
         assert (tmp_path / "sub" / "s.db").exists()
     finally:
         sqlite.close()
+
+
+@SHARED
+def test_open_store_opens_the_shared_store_of_the_setting(store_kind, request, tmp_path):
+    from insurance_claims.config import load_settings
+
+    spec = f"sqlite:///{tmp_path / 's.db'}" if store_kind == "sqlite" else request.getfixturevalue("postgres_url")
+    store = open_store(dataclasses.replace(load_settings(), session_store=spec, store_pool_size=3))
+    try:
+        assert isinstance(store, SqliteStore if store_kind == "sqlite" else PostgresStore)
+        assert store.shared and store.kind == store_kind
+        if store_kind == "postgres":
+            assert store.pool_size == 3
+        s = new_state()
+        store.create(s)
+        assert store.read(s.session_id) == s
+    finally:
+        store.close()

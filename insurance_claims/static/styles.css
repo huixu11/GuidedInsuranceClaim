@@ -893,6 +893,12 @@ details[open] > summary > .chev {
   overflow-wrap: anywhere;
 }
 
+/* Delivery of a queued email or handoff: Queued / Sent / Not delivered, in its tone. */
+.delivery-status {
+  font-weight: 500;
+  white-space: nowrap;
+}
+
 .chat-email .email-body {
   max-height: calc(4 * 1.5 * 13.5px);
   margin-top: 10px;

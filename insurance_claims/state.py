@@ -7,6 +7,7 @@ block) built from it each turn.
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass, field, fields
 from enum import Enum
 from typing import Any
@@ -16,6 +17,47 @@ from .identity import FIELD_LABELS, MATCHED, NOT_PROVIDED, PII_FIELDS
 # Version of the stored record layout (`SessionState.to_record`). Bump it when a field changes
 # meaning, so a store can tell an old record from a new one.
 RECORD_FORMAT = 1
+
+# Lists that only ever grow by appending, one or more entries a turn. A store may keep each as
+# rows of its own (written once) instead of rewriting them with the rest of the state.
+APPEND_ONLY_FIELDS = ("messages", "traces", "events")
+
+# The audit events the engine writes (`SessionState.audit`) and the keys their `data` may hold.
+# Every value is an id (party, claim), a field name, a count, a boolean or a fixed code: never
+# text the caller or the model produced, no identifier values, no amounts. The trail may be kept
+# much longer than the conversation, so a new key or code needs the same care
+# (tests/test_audit.py checks every value against the codes it knows).
+AUDIT_EVENTS: dict[str, tuple[str, ...]] = {
+    "conversation_started": ("consent_scenario", "phase"),
+    "tool_called": ("tool", "actor", "case_id", "case_ids", "topic", "party_id", "refused", "reason"),
+    "identity_checked": (
+        "matched_fields", "mismatched_fields", "matched_count", "policy_number_status", "candidate_party_id",
+    ),
+    "verification_strike": ("fields", "failed_attempts", "max_failed_attempts"),
+    "verification_refusal": ("refusal", "refusal_count", "max_persuasion_attempts"),
+    "identity_verified": (
+        "party_id", "caller_role", "matched_fields", "matched_count", "required_matches",
+        "identifier_values_cleared",  # identity_claims and seen_mismatches emptied at this point
+    ),
+    "role_change_ignored": ("kept_role",),
+    "consent_requested": ("party_id", "channel"),
+    "consent_result": ("party_id", "result", "polls"),
+    "phase_changed": ("from", "to", "reason"),
+    "claim_selected": ("case_id", "path"),
+    "claim_choice_rejected": ("case_id", "reason"),
+    "out_of_scope": ("scope", "consecutive", "total", "limit"),
+    "human_offered": ("reason",),
+    "escalated": ("reason", "verified", "phase"),
+    "turn_limit_reached": ("limit",),
+    "email_offered": ("remembered_preference",),
+    "email_other_address_declined": ("reasks", "max_reasks"),
+    "email_decision": ("decision", "defaulted"),
+    "email_queued": ("recipient", "case_ids", "summary_source"),
+    "guard_blocked": ("target", "rules", "outcome"),
+    "model_refused": ("call", "outcome"),
+    "conversation_closed": ("status", "reason", "verified", "phase"),
+    "conversation_reopened": ("reason", "phase"),
+}
 
 
 class Phase(str, Enum):
@@ -94,7 +136,8 @@ class SessionState:
     phase_history: list[dict[str, Any]] = field(default_factory=list)
 
     # --- identity / verification gate ------------------------------------
-    identity_claims: dict[str, str] = field(default_factory=dict)  # what the caller supplied
+    # What the caller supplied, as typed; emptied once verified (policy._forget_identifier_values).
+    identity_claims: dict[str, str] = field(default_factory=dict)
     caller_role: str = "unknown"  # policyholder | representative | unknown
     rep_name: str | None = None
     rep_relationship: str | None = None
@@ -107,7 +150,11 @@ class SessionState:
     )
     policy_status: str = NOT_PROVIDED
     failed_attempts: int = 0
-    seen_mismatches: list[str] = field(default_factory=list)  # "field=normalized value"
+    # Wrong values already counted as a strike, as "field:<keyed digest of the normalised value>"
+    # (policy._mismatch_key), so a repeat can be told from a new value without keeping the value.
+    # Records written before this held "field=<normalised value>"; those are still recognised.
+    # Emptied once verified, like identity_claims.
+    seen_mismatches: list[str] = field(default_factory=list)
     declined_fields: list[str] = field(default_factory=list)
     consent_required: bool = False
     consent_status: str = "not_required"  # not_required|not_requested|pending|approved|timed_out
@@ -154,8 +201,23 @@ class SessionState:
     messages: list[dict[str, Any]] = field(default_factory=list)
     traces: list[dict[str, Any]] = field(default_factory=list)
     grounding: list[str] = field(default_factory=list)  # tool/claim data shown to the model
+    # The audit trail: what the harness decided or did, in order. Never what was said: ids,
+    # field names, counts and enums only (see `audit`). A store may keep it longer than the
+    # conversation itself.
+    events: list[dict[str, Any]] = field(default_factory=list)
+    # Fields written by a newer version of the code that this one does not know. They are
+    # carried along and written back unchanged, so old and new processes can serve the same
+    # conversation while a deployment rolls out.
+    unknown_fields: dict[str, Any] = field(default_factory=dict)
 
     # -- helpers -------------------------------------------------------------
+    def audit(self, event: str, **data: Any) -> None:
+        """Append one audit event. `data` must not hold identifier values, message text or
+        amounts: only ids (party, claim), field names, counts and enums."""
+        self.events.append(
+            {"seq": len(self.events), "turn": self.turn, "at": round(time.time(), 3), "type": event, "data": data}
+        )
+
     @property
     def matched_count(self) -> int:
         return sum(1 for f in PII_FIELDS if self.field_status.get(f) == MATCHED)
@@ -189,8 +251,10 @@ class SessionState:
         record is as sensitive as the conversation itself. The result may share lists and dicts
         with the state; serialise it before keeping it.
         """
-        record: dict[str, Any] = {"format": RECORD_FORMAT}
+        record: dict[str, Any] = {"format": RECORD_FORMAT, **self.unknown_fields}
         for f in fields(self):
+            if f.name == "unknown_fields":
+                continue
             value = getattr(self, f.name)
             if f.name == "phase":
                 value = value.value
@@ -208,17 +272,17 @@ class SessionState:
         """Rebuild a state from `to_record()` output (after a JSON round trip).
 
         A field missing from the record takes its default, so records written before a field
-        was added still load. An unknown field is an error rather than silently dropped, since
-        the next commit would otherwise lose it.
+        was added still load. A field this version does not know (written by a newer one) is
+        kept in `unknown_fields` and written back by `to_record`, so it is neither an error nor
+        lost. A different `format` is an error: that marks a change old code must not guess at.
         """
         data = dict(record)
         fmt = data.pop("format", RECORD_FORMAT)
         if fmt != RECORD_FORMAT:
             raise ValueError(f"unsupported session record format {fmt!r}")
-        known = {f.name for f in fields(cls)}
-        unknown = sorted(set(data) - known)
-        if unknown:
-            raise ValueError(f"unknown fields in session record: {', '.join(unknown)}")
+        known = {f.name for f in fields(cls)} - {"unknown_fields"}
+        carried = {name: data.pop(name) for name in sorted(set(data) - known)}
+        data["unknown_fields"] = carried
         if "phase" in data:
             data["phase"] = Phase(data["phase"])
         for name in _MEMORY_ITEM_FIELDS:

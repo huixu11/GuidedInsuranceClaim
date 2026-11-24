@@ -1,7 +1,11 @@
 """Run the demo server:  python -m insurance_claims [--mock] [--host H] [--port P] [--workers N]
 
 Several worker processes (--workers N or SOP_WORKERS=N) need a session store they all share
-(SOP_SESSION_STORE=sqlite:///path/sessions.db); see the README, "Scaling and limits".
+(SOP_SESSION_STORE=sqlite:///path/sessions.db, or postgresql://user:password@host:5432/db);
+see the README, "Scaling and limits".
+
+On SIGTERM (or Ctrl+C) the server stops accepting, gives the requests in flight up to
+SOP_SHUTDOWN_GRACE_SECONDS (default 30) to finish, then stops its dispatcher and closes the store.
 """
 
 from __future__ import annotations
@@ -14,7 +18,8 @@ from typing import Any
 
 import uvicorn
 
-from .config import load_dotenv
+from .config import load_dotenv, load_settings
+from .dispatch import build_transports
 from .store import parse_store_spec
 
 _SESSION_IN_PATH = re.compile(r"(/api/sessions/[^/?#]{8})[^/?#]*")
@@ -86,8 +91,8 @@ def main(argv: list[str] | None = None) -> None:
         "--workers",
         type=int,
         default=_env_workers(),
-        help="worker processes (default: SOP_WORKERS or 1); more than one needs "
-        "SOP_SESSION_STORE=sqlite:///path/sessions.db",
+        help="worker processes (default: SOP_WORKERS or 1); more than one needs a shared store: "
+        "SOP_SESSION_STORE=sqlite:///path/sessions.db or postgresql://user:password@host:5432/db",
     )
     args = parser.parse_args(argv)
     if args.mock:
@@ -103,8 +108,17 @@ def main(argv: list[str] | None = None) -> None:
             f"--workers {args.workers} needs a session store that every worker shares; with the "
             "in-memory store each worker would hold its own conversations and answer 404 for the "
             "others'. Set SOP_SESSION_STORE=sqlite:///path/sessions.db (e.g. /data/sessions.db "
-            "in the container), or run one worker."
+            "in the container) or postgresql://user:password@host:5432/db, or run one worker."
         )
+    try:
+        settings = load_settings()
+        # A delivery misconfiguration (e.g. SOP_EMAIL_TRANSPORT=smtp without SOP_SMTP_URL) stops
+        # the start here, with a message that names the setting and never shows its value. With
+        # SOP_DISPATCH=off another process delivers, and its own start checks them.
+        if settings.dispatch:
+            build_transports(settings)
+    except ValueError as exc:
+        parser.error(str(exc))
     level = os.environ.get("LOG_LEVEL", "INFO").upper()
     # workers is passed explicitly: left unset, uvicorn would read WEB_CONCURRENCY behind the
     # check above. proxy_headers is off so the client address is always the socket peer; the
@@ -116,6 +130,7 @@ def main(argv: list[str] | None = None) -> None:
         workers=args.workers,
         proxy_headers=False,
         log_config=logging_config(level),
+        timeout_graceful_shutdown=settings.shutdown_grace_seconds,
     )
 
 

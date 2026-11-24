@@ -442,7 +442,7 @@ def test_a_model_error_while_phrasing_does_not_roll_back_a_decided_turn(verified
 
     monkeypatch.setattr(verified.backend, "respond", broken)
     reply = verified.say("yes", yes_no="yes")  # the email goes out during the decision step
-    assert len(verified.state.outbox) == 1 and "I've sent the summary" in reply
+    assert len(verified.state.outbox) == 1 and "the summary is on its way" in reply
 
 
 # ---------------------------------------------------------------------------

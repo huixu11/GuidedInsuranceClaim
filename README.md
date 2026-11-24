@@ -36,6 +36,14 @@ docker run --rm -p 8000:8000 -e ANTHROPIC_API_KEY=sk-ant-... sop-agent
 
 Open <http://localhost:8000>.
 
+Three instances behind a load balancer on one PostgreSQL database, to see that any instance can
+be lost ([Scale and failure](#scale-and-failure-the-design)):
+
+```bash
+docker compose -f docker-compose.ha.yml up --build --wait     # then open http://localhost:8080
+docker kill sop-ha-app2-1                                     # carry on with the conversation
+```
+
 ### Local Python (3.11+; developed and tested on 3.14)
 
 ```bash
@@ -116,9 +124,11 @@ and pressing Enter four times; the next few are the detours most worth trying at
 frustrated caller, a partial answer, an off-topic question, a request for a human). Clicking one
 fills the message box so it can be edited before sending. **More** lists every suggestion by phase.
 
-When the summary email is sent it appears in the chat under the agent's reply, as well as in the
-Overview. A conversation survives a page reload, and `?session=<id>` opens an existing one
-(sessions live in server memory, so a server restart starts fresh).
+When the caller chooses to have the summary email sent, it appears in the chat under the agent's
+reply, as well as in the Overview, with its delivery status (queued, then sent, or not delivered);
+a handoff to a human shows its status the same way. A conversation survives a page reload, and
+`?session=<id>` opens an existing one (with the default in-memory store a server restart starts
+fresh; with a SQLite or PostgreSQL store it does not).
 
 ![The last step: the summary email shown in the chat after the caller chose to send it](docs/ui-email-summary.png)
 
@@ -228,7 +238,7 @@ Nothing leads back to, or around, `VERIFY_ID`. A conversation ends as `completed
 | Remember information said early | `_remember` runs before any phase logic, every turn; items carry the phase/turn they were captured in | `policy._remember`, `state.py` |
 | Use remembered hints after verification | Phases cascade within a turn; the resolver receives the hints; the reply is told to pick up from them | `policy.step`, `prompts.resolve_user_prompt` |
 | In-scope only; polite refusal; human after repeated off-topic | Scope classified per message; strikes counted in code; offer at the limit, transfer after it | `policy._track_guardrails` |
-| Email summary with send / skip | Always offered on entering POST_PROCESS (a preference stated earlier in the call is remembered and mentioned, and the caller still chooses); explicit choice required; summary drafted from records and transcript; simulated send to an outbox | `policy._handle_post`, `tools.send_summary_email` |
+| Email summary with send / skip | Always offered on entering POST_PROCESS (a preference stated earlier in the call is remembered and mentioned, and the caller still chooses); explicit choice required; summary drafted from records and transcript; queued with the turn and delivered by the dispatcher (a demo transport by default, SMTP optional) | `policy._handle_post`, `tools.send_summary_email`, `dispatch.py` |
 | Emotion, empathy, explaining why, alternatives, knowing when to stop | Emotion and refusal tracked per turn; empathy / explain-why / offer-human modifiers; persuasion ladder with a hard stop | `policy._handle_verify`, `prompts._modifier_lines` |
 
 ### Verification rules
@@ -319,8 +329,10 @@ still be verified. No gate is ever relaxed as part of de-escalation.
 | `SOP_MAX_PERSUASION_ATTEMPTS` | `2` | Attempts to persuade a caller who refuses verification |
 | `SOP_EXPOSE_FIXTURES` | `1` | Show fixture data in the UI's Test data drawer |
 | `HOST`, `PORT` | `127.0.0.1`, `8000` | Bind address (the Docker image binds `0.0.0.0`) |
-| `SOP_SESSION_STORE` | `memory` | Where conversations live: `memory` (this process) or a SQLite file (`sqlite:///path/sessions.db` or a plain path) shared by the workers and instances on one machine |
-| `SOP_WORKERS` | `1` | Worker processes (same as `--workers`); more than one needs the SQLite store |
+| `SOP_SESSION_STORE` | `memory` | Where conversations live: `memory` (this process); a SQLite file (`sqlite:///path/sessions.db` or a plain path) shared by the workers and instances on one machine; or `postgresql://user:password@host:5432/db`, shared by instances on any number of machines |
+| `SOP_WORKERS` | `1` | Worker processes (same as `--workers`); more than one needs a shared store |
+| `SOP_DATA_KEY` | — | 32 random bytes (base64 or hex): encrypts transcripts, state, traces and queued e-mails at rest in the SQLite and PostgreSQL stores |
+| `SOP_EMAIL_TRANSPORT`, `SOP_HANDOFF_TRANSPORT` | `demo`, `demo` | How the summary e-mail and the handoff to a human leave: `demo` (nothing leaves the machine) or `smtp` / `webhook` ([Delivery settings](#delivery-settings)) |
 | `SOP_MAX_CONCURRENT_TURNS` | `64` | Turns processed at once per process; beyond that a turn waits briefly, then gets `503` |
 | `SOP_MAX_TURNS_PER_CONVERSATION` | `60` | Caller messages per conversation; the last one is answered by a handoff to a human |
 | `SOP_MAX_SESSIONS`, `SOP_MAX_STORE_MB`, `SOP_SESSION_TTL_SECONDS` | `50000`, `1024`, `14400` | Conversations held, state held in memory (memory store), idle expiry |
@@ -328,7 +340,8 @@ still be verified. No gate is ever relaxed as part of de-escalation.
 | `SOP_MOCK_LATENCY_MS` | `0` | Offline double only: time each simulated model call takes, for load tests |
 
 The serving settings, the remaining waits and what each limit answers are described in
-[Scaling and limits](#scaling-and-limits).
+[Scaling and limits](#scaling-and-limits); how the service is built to grow and to survive
+failures is in [Scale and failure: the design](#scale-and-failure-the-design).
 
 A turn makes two to four model calls (understand; resolve on the turn a claim is selected;
 respond; one more if the model calls a tool). The structured calls are short extraction and
@@ -337,6 +350,123 @@ phrases the replies. Measured on the ten scripted scenarios with the defaults (l
 typically 3–5 s per turn, and 6–9 s for a turn that verifies, selects the claim and answers in
 one go or that calls a tool. With `claude-opus-5-5` for everything the scenarios reached the
 same outcomes at typically 5–7 s per turn (10–13 s for the heaviest turns).
+
+## Scale and failure: the design
+
+The harness above decides what the agent may say and do. This section is about the other half of
+a service: many callers at once, and what happens when a part of it breaks. The short version:
+
+```
+                              ┌─ instance 1 ─┐
+callers ─► load balancer ─────┼─ instance 2 ─┼────► PostgreSQL ◄──── dispatcher (a thread in
+           (uses /readyz)     └─ instance N ─┘      conversations     every instance) ──► e-mail,
+                                     │              messages, traces                      human-agent
+                                     ▼              audit_events                          desk
+                                 model API          outbox
+```
+
+Six rules, and everything else follows from them:
+
+1. **An instance holds nothing.** Whatever a conversation needs between two messages is in the
+   store. Any instance answers any message of any conversation, so there are no sticky sessions,
+   adding instances adds capacity, and losing one loses no conversation.
+2. **A turn is one transaction.** It works on a private copy and at the end writes the state, the
+   new transcript rows, the audit events and the queued effects together, or nothing.
+3. **One turn at a time per conversation, held by a lease.** One atomic `UPDATE` takes the
+   conversation for 20 s and a background thread renews it while the turn runs. A process that
+   dies stops renewing, so its conversations are free again within 20 s without anyone cleaning
+   up. A turn that lost its lease cannot write: its commit checks the owner and the version.
+4. **Every message can be sent again.** The client attaches a `message_id`. If that message was
+   already answered, the stored answer comes back (`"replayed": true`) and no turn runs. "The
+   instance died", "the answer got lost" and "the request timed out" therefore all have the same
+   remedy on the client: send it again.
+5. **The outside world is reached through a queue.** An e-mail or a handoff to a human is a row
+   in `outbox`, written in the turn's transaction and delivered afterwards by a dispatcher with
+   retries, backoff and an idempotency key. A slow mail system cannot slow a turn down, a crash
+   cannot lose an e-mail, and no e-mail goes out for a turn that was never committed.
+6. **Every wait has a limit, and every refusal says when to come back.** Turn slots, the wait for
+   a busy conversation, the store, each model call, the turn as a whole, the size of a
+   conversation: each has a bound, and what exceeds it gets an error with `Retry-After` instead
+   of a queue that grows.
+
+### What happens when something fails
+
+| What fails | What the system does | What the caller sees | Checked by |
+|---|---|---|---|
+| **An instance dies in the middle of a turn** | Nothing of the turn was written. Its lease lapses within `SOP_TURN_LEASE_SECONDS` (20 s). | The request fails; the retry (same `message_id`) waits for the lease if need be (`409 conversation_busy` + `Retry-After` meanwhile) and is answered by another instance. | `scripts/failover_test.py` (kills one of three instances mid-run); `test_store_leases.py` (a killed process's hold) |
+| **An instance dies after the commit, before the answer arrives** | The turn is stored. | The retry gets the stored answer, marked `replayed`; the turn does not run twice. | `test_idempotent_messages.py` (the retry is answered by another server process on the same store); `failover_test.py` sends one message twice to two instances |
+| **An instance is stopped for a deploy** (`SIGTERM`) | It stops accepting connections (so the load balancer moves on to the others), finishes the turns it has for up to `SOP_SHUTDOWN_GRACE_SECONDS` (30), stops its dispatcher and closes the store. A turn cut off by the grace period is not committed. | Nothing, or one retry. | `test_delivery_api.py` (a turn inside the grace period is committed, one cut off is not) |
+| **The database is unreachable** | Every operation fails fast (`StoreUnavailable`); nothing is half-written. The same processes reconnect when it is back: no restart. | `503 server_busy` + `Retry-After`; `/readyz` says 503, so the load balancer stops sending traffic. | `test_store_postgres.py` (the server is stopped and started under a live store); the `ha` CI job stops and starts the database container |
+| **The model API is slow or down** | One attempt is cut off after `SOP_MODEL_TIMEOUT_SECONDS` (60); no call starts later than `SOP_TURN_BUDGET_SECONDS` (120) into a turn. After 5 unanswered calls in a row the circuit breaker refuses calls at once for 15 s, then lets one probe through. One caller's bad key or rate limit never opens it. | Before the engine has decided: `503 model_unavailable` + `Retry-After`, nothing recorded. After it has decided: the fixed template wording for that step, so the decision is never lost. | `test_llm_resilience.py` |
+| **The model API rate-limits the key** | The SDK retries with backoff; then the turn fails and nothing is recorded. | `429 rate_limited` with the provider's `Retry-After`. | `test_llm_resilience.py` |
+| **The mail system or the agent desk is down** | Turns are unaffected. The effect stays in `outbox` and is retried with backoff (2 s … 5 min); after `SOP_DISPATCH_MAX_ATTEMPTS` (8) it is marked `dead` and shows in `/api/stats`. | The conversation continues; the delivery status in the UI stays "queued", then "failed". | `test_dispatch.py` (a sink that fails, hangs, recovers) |
+| **An instance dies after sending an e-mail, before recording it** | The claim on the effect lapses (120 s) and another dispatcher sends it again, with the same idempotency key (the e-mail's `Message-ID`, the webhook's `Idempotency-Key`). Delivery is at least once; the receiver de-duplicates. | At worst the same e-mail twice. | `test_dispatch.py` (a lapsed claim is redelivered) |
+| **More callers than capacity** | A turn waits for a slot for 2 s, then is refused. Memory and latency stay bounded. | `503 server_busy` + `Retry-After` of about one turn; the UI retries by itself. | `test_serving.py`; the load test with slow model calls |
+| **The same message is sent twice, or twice at once** | The second one waits for the first, then gets its answer. | One answer, once. | `test_idempotent_messages.py` (two threads, all three stores) |
+| **New code is rolled out next to old code** | A record written by newer code keeps the fields older code does not know and writes them back; a record in a newer format is refused, not guessed at. Schema creation runs under an advisory lock, so instances starting together do not collide. | Nothing. | `test_store.py`, `test_store_postgres.py` |
+| **The data key is wrong or missing** | Encrypted rows cannot be read: the turn fails and releases its hold; nothing is overwritten. | An error; the data is intact for the right key. | `test_store_crypto.py` |
+
+### Single points of failure
+
+| Part | In this repository | Redundant? |
+|---|---|---|
+| Application instances | Identical, stateless processes; `docker-compose.ha.yml` runs three behind a load balancer | **Yes.** Killing one loses nothing (the `ha` CI job and `failover_test.py` do exactly that). |
+| Dispatcher (e-mail, handoff) | A thread in every instance (or `python -m insurance_claims.dispatch` on its own) | **Yes.** They share the queue through row claims (`FOR UPDATE SKIP LOCKED`); a dead one's claims lapse. |
+| Session store | One PostgreSQL database | **Not in this repository.** A single database container is what `docker-compose.ha.yml` starts, and it is that file's single point of failure. In production this is a managed PostgreSQL with a synchronous standby and automatic failover (RDS Multi-AZ, Cloud SQL HA, Patroni). What the application needs for that is here and tested: it survives the database disappearing and coming back without a restart, and a turn whose commit did not go through is simply retried. What is not tested here is a real failover between two database nodes. |
+| Load balancer | A Caddy container in `docker-compose.ha.yml` | **Not in this repository**: in production the platform's load balancer, which has more than one node. It needs no state (no stickiness). |
+| Model API | One provider, one region | **No.** Its outage is contained (timeouts, breaker, template replies after the decision) but verification of new callers stops, because reading a message needs the model. A second provider or region behind the same backend interface would be the remedy. |
+| E-mail / human-agent desk | Simulated by default; SMTP and a webhook are implemented | Their outage only delays deliveries (the queue). |
+
+### What is stored, and where
+
+| Table | One row per | Written | Holds | Kept |
+|---|---|---|---|---|
+| `conversations` | conversation | rewritten each turn (small) | the working state as JSON: phase, verification progress, counters, the selected claim, what the caller asked for, the summary e-mail as composed, the handoff summary | until idle for `SOP_SESSION_TTL_SECONDS` (4 h) |
+| `messages` | transcript entry | once | role, text, turn, `message_id` | with the conversation |
+| `traces` | turn | once | what the harness decided and why (for the UI's trace panel) | with the conversation |
+| `audit_events` | decision | once | *what happened*, never what was said: phase changes, verification checks (which field, matched or not, never the value), tool calls and refusals, consent, escalation, e-mail queued, guard blocks | `SOP_AUDIT_RETENTION_DAYS` (90) after the conversation is gone |
+| `outbox` | e-mail or handoff to deliver | once, then status updates | kind, payload, status (`pending`/`sent`/`dead`), attempts | until delivered and the conversation is gone |
+
+- A turn appends rows; it never rewrites the transcript. The old layout stored a whole
+  conversation as one JSON value and rewrote all of it on every turn (268 KB per turn for a long
+  one); now a turn writes only what it added.
+- With `SOP_DATA_KEY` set, the state, the transcript, the traces and the queued payloads are
+  encrypted at rest (AES-256-GCM, each value bound to its row). The audit trail is not: it holds
+  no personal data by construction, and `test_audit.py` checks that over random conversations.
+- Identity values are not kept after they have served: once a caller is verified, the stated
+  values are dropped from the state, and wrong values are remembered only as keyed digests (to
+  count a repeated wrong value once).
+- `GET /api/sessions/{id}/audit` returns the audit events and the delivery status of the effects.
+
+### How far it scales
+
+- **Instances.** Capacity grows with instances until the next ceiling. One process runs 64 turns
+  at once (`SOP_MAX_CONCURRENT_TURNS`); with live turns of 4–7 s that is 9–15 turns a second, or
+  200–400 callers in conversation ([the arithmetic](#the-arithmetic-for-live-turns)).
+- **The first ceiling is the model provider.** 10,000 callers in conversation at once send about
+  400 messages a second, which is about 1,000 model requests a second. No instance count helps
+  before the account's rate limit allows that; `SOP_MAX_CONCURRENT_TURNS` × instances should be
+  set to what the account sustains, and the rest is refused cleanly.
+- **The database comes well after that.** A turn costs the database two short transactions (take
+  the lease and load; commit), plus one small lease renewal every few seconds while it waits for
+  the model. Two instances on one PostgreSQL, all on one laptop, answered 120–130 turns a second
+  with every conversation checked ([Load test](#load-test)): four to six times what their 128
+  turn slots can use with a live model (20–30 turns a second). Every query is by conversation
+  id, so the data can be partitioned by it when one database is no longer enough; only the
+  outbox claims and the sweeps look across conversations.
+- **Connections.** A turn holds a database connection only for its two transactions, not while
+  it waits for the model, so 20 connections per process are enough for 64 slots. Instances ×
+  `SOP_STORE_POOL_SIZE` must stay below the database's `max_connections` (a pooler such as
+  PgBouncer beyond that).
+- **What does not scale out here:** the per-client rate limit is per instance (a gateway's job),
+  and `/api/stats` is per process.
+
+### Built and tested here, and designed only
+
+| | |
+|---|---|
+| **Built, and exercised by tests or CI** | Stateless instances on a shared store (SQLite on one machine, PostgreSQL across machines); leases with renewal; idempotent messages; the outbox with a dispatcher, retries and dead-lettering; SMTP and webhook transports against local sinks; model timeouts, turn budget and circuit breaker; `/readyz`; graceful shutdown; encryption at rest; the audit trail; an instance killed mid-run on SQLite and PostgreSQL; three containers behind a load balancer with one killed and the database restarted (CI). |
+| **Designed, not built or not testable here** | Database failover between nodes; a second model provider; a gateway (TLS, authentication, global rate limits); metrics, tracing and alerts beyond `/api/stats`; key rotation for the data key; a real mail system and a real agent desk (the transports exist, the systems are simulated, as the brief's fixtures simulate consent). |
 
 ## Scaling and limits
 
@@ -373,25 +503,37 @@ Messages API, a few seconds in all. The server is built around that:
 | `400` | `bad_request` | Malformed body, empty or over-long message, text that is not valid Unicode | — | error row |
 | `413` | `payload_too_large` | Body over 16 KB | — | error row |
 | `429` | `rate_limited` | The client's budget is spent (only with the rate limit on) | until the next token | retries by itself (≤10 s) |
-| `503` | `server_busy` | No turn slot free within the wait (or the SQLite store locked for 5 s) | ≈ median turn time | retries by itself |
+| `503` | `server_busy` | No turn slot free within the wait; or the session store does not answer; or the instance is shutting down | ≈ median turn time, or `1` | retries by itself |
+| `503` | `model_unavailable` | The model service has not answered five calls in a row, so calls are refused at once for a while (circuit breaker) | until the next probe, ≤ 15 s | retries by itself (≤10 s) |
+| `503` | `model_overloaded` | The model service says it is overloaded, after the SDK's own retries | the provider's, else `5` | retries by itself |
+| `504` | `turn_timeout` | The time allowed for one turn ran out before the engine could decide | — | error row |
 | `409` | `conversation_busy` | The same conversation is mid-turn beyond the wait | `1` | retries by itself |
 | `409` | `conversation_closed` | The message cap was reached earlier | — | error row, no retry |
+| `409` | `message_id_reused` | The `message_id` was already used for a different text in this conversation | — | error row, no retry |
 | `404` | `session_not_found` | Never created, expired, or evicted to make room | — | offers a new conversation |
 
 Every one uses the error envelope `{"error": {"code", "message"}}` and changes nothing. The UI
 retries a busy answer up to three times, honouring `Retry-After`, while the typing indicator
 stays up; only then does it show the error row with its Retry button.
 
+**Sending a message again is always safe.** A message may carry a `message_id` (8 to 64 letters,
+digits, `-` or `_`). If the conversation already holds a message with that id, the answer that
+was stored for it is returned with `"replayed": true`: the engine does not run and nothing is
+written. The check happens while the conversation is held, so a retry that arrives while the
+first attempt is still running waits for it and then gets its answer. The UI gives every message
+an id and reuses it for its automatic retries and for the Retry button, and so do the scripts. A
+client that sends no id gets the old behaviour: a retry after a lost answer runs the turn again.
+
 ### The arithmetic for live turns
 
-- **Turns per process.** A live turn takes typically 3–5 s (see above): the median was 4.0 s
-  over the ten scripted scenarios, and 6.3 s for the demo conversation, whose answers are long
+- **Turns per process.** A live turn takes typically 3–7 s (see above): the median was 4.4 s
+  over the ten scripted scenarios, and 6.8 s for the demo conversation, whose answers are long
   and drawn from the document guidance ([measured below](#with-the-live-model)). With 64 slots
-  one process therefore answers at most about 64 / 4 s ≈ 16 turns per second, or 64 / 6.3 s ≈ 10
+  one process therefore answers at most about 64 / 4.4 s ≈ 15 turns per second, or 64 / 6.8 s ≈ 9
   when every turn is a long one. A caller sends a message every 20–30 s or so (reading, typing,
   waiting), so that is in the order of 200–400 callers in conversation at once per process,
-  depending on what they ask — provided the model API account allows 10–16 turns × 2–3 calls
-  ≈ 25–50 requests a second and the tokens that go with them. In practice the account's rate
+  depending on what they ask — provided the model API account allows 9–15 turns × 2–3 calls
+  ≈ 25–45 requests a second and the tokens that go with them. In practice the account's rate
   limits are the first ceiling: set `SOP_MAX_CONCURRENT_TURNS` to what the account sustains, and
   the server refuses the rest cleanly instead of collecting the API's `429`s.
 - **Threads.** 64 turn threads plus the default pool of 40 for everything else, per process.
@@ -413,11 +555,19 @@ stays up; only then does it show the error row with its Retry button.
 | `SOP_TURN_SLOT_WAIT_SECONDS` | `2` | How long a turn waits for a slot before `503` |
 | `SOP_CONVERSATION_WAIT_SECONDS` | `5` | How long a message waits for its conversation's previous turn before `409` |
 | `SOP_MAX_TURNS_PER_CONVERSATION` | `60` | Caller messages per conversation; the last one is answered by a handoff |
-| `SOP_SESSION_STORE` | `memory` | `memory`, or a SQLite file: `sqlite:///relative/path.db`, `sqlite:////absolute/path.db`, or a plain path |
-| `SOP_MAX_SESSIONS` | `50000` | Conversations held; the least recently used is evicted beyond it (both stores) |
+| `SOP_SESSION_STORE` | `memory` | `memory`; a SQLite file (`sqlite:///relative/path.db`, `sqlite:////absolute/path.db`, or a plain path); or `postgresql://user:password@host:5432/db` |
+| `SOP_STORE_POOL_SIZE` | `20` | PostgreSQL: connections per process. A turn holds one only for its two short transactions, not while it waits for the model |
+| `SOP_DATA_KEY` | — | SQLite and PostgreSQL: encryption at rest (AES-256-GCM) of state, transcript, traces and queued payloads; 32 random bytes as base64 or hex. A malformed key stops the start |
+| `SOP_AUDIT_RETENTION_DAYS` | `90` | SQLite and PostgreSQL: how long audit events are kept after their conversation is gone |
+| `SOP_MAX_SESSIONS` | `50000` | Conversations held; the least recently used is evicted beyond it (every store) |
 | `SOP_MAX_STORE_MB` | `1024` | Memory store only: state held; the least recently used is evicted beyond it (`0` = no limit) |
 | `SOP_SESSION_TTL_SECONDS` | `14400` | An idle conversation expires (checked on every read and turn) |
-| `SOP_TURN_LEASE_SECONDS` | `300` | SQLite store: a turn's hold on a conversation lapses by itself after this, so a crashed worker cannot lock it forever. Keep it well above the longest turn; a turn that outlives it is not written (`409`) rather than overwrite a newer one |
+| `SOP_TURN_LEASE_SECONDS` | `20` | SQLite and PostgreSQL: a turn holds its conversation by a lease that a background thread renews about every third of it. A process that dies stops renewing, so what it held is free again within this time (at least 5) |
+| `SOP_TURN_MAX_SECONDS` | `300` | A turn's lease is renewed for at most this long; kept above the longest possible turn (the next three settings), so a running turn never loses its hold |
+| `SOP_MODEL_TIMEOUT_SECONDS`, `SOP_MODEL_MAX_RETRIES` | `60`, `2` | One attempt of one model call is cut off after the timeout; the SDK retries a failed attempt (no connection, 429, 5xx) this many times |
+| `SOP_TURN_BUDGET_SECONDS` | `120` | No model call starts later than this into a turn (`504 turn_timeout`, or the template reply once the engine has decided) |
+| `SOP_MODEL_BREAKER_FAILURES`, `SOP_MODEL_BREAKER_SECONDS` | `5`, `15` | Circuit breaker: after that many calls in a row that the model service did not answer, calls are refused at once (`503 model_unavailable`) for that long, then one probe is let through. `0` failures = off |
+| `SOP_SHUTDOWN_GRACE_SECONDS` | `30` | On `SIGTERM` the instance stops accepting and lets the turns it has finish for this long; a turn cut off is not committed |
 | `SOP_WORKERS` | `1` | Worker processes (`--workers N`); more than one is refused with the memory store |
 | `SOP_RATE_LIMIT_PER_MINUTE` | `0` | Messages per client per minute, per instance; new conversations get a quarter of it (at least 1). `0` = off |
 | `SOP_TRUST_PROXY` | `0` | `1`: the client is the last `X-Forwarded-For` hop (the address your own proxy saw), for the rate limit. Otherwise the socket peer |
@@ -426,6 +576,24 @@ stays up; only then does it show the error row with its Retry button.
 "Last use", for expiry and eviction, is the creation of a conversation or the start or commit of
 one of its turns; reading it is not use. A conversation mid-turn is never evicted or expired.
 
+#### Delivery settings
+
+The summary e-mail and the handoff to a human are queued with the turn and delivered afterwards
+(`insurance_claims/dispatch.py`). By default nothing leaves the machine.
+
+| Variable | Default | Effect |
+|---|---|---|
+| `SOP_DISPATCH` | `on` | `on`: this process also delivers. `off`: another process does (`python -m insurance_claims.dispatch`) |
+| `SOP_DISPATCH_POLL_SECONDS` | `1` | Pause between rounds that found nothing to deliver |
+| `SOP_DISPATCH_MAX_ATTEMPTS` | `8` | A delivery that fails temporarily is retried with backoff (2 s, 4 s … 5 min) this many times, then marked failed |
+| `SOP_EMAIL_TRANSPORT` | `demo` | `demo` (one log line, nothing sent) or `smtp` |
+| `SOP_SMTP_URL`, `SOP_EMAIL_FROM` | — | For `smtp`: `smtp://user:password@host:587` (STARTTLS when offered; a password is never sent in clear) or `smtps://…:465`, and the sender |
+| `SOP_EMAIL_REDIRECT_TO` | — | Every e-mail goes to this one address instead, with the intended recipient masked in a header. The fixture addresses are fictitious, so a deployment of the demo must not mail them |
+| `SOP_HANDOFF_TRANSPORT` | `demo` | `demo` or `webhook` |
+| `SOP_HANDOFF_WEBHOOK_URL`, `SOP_HANDOFF_WEBHOOK_TOKEN` | — | For `webhook`: where the handoff (reason, summary, conversation id) is POSTed as JSON, with an `Idempotency-Key` header and the token as a Bearer token |
+
+A misconfigured transport stops the start with a message that names the setting and no secret.
+
 The rate limiter is in memory, so each worker and each instance keeps its own buckets: it
 protects one process from one noisy client, nothing more. A global limit, quotas per user and
 authentication belong in a gateway in front of the instances.
@@ -433,8 +601,13 @@ authentication belong in a gateway in front of the instances.
 ### Several workers, several instances
 
 Conversations in the memory store belong to one process, so `--workers N` (or `SOP_WORKERS`)
-with N > 1 is refused at start until `SOP_SESSION_STORE` names a SQLite file, which every
-worker and every instance on the machine then shares (and which survives a restart):
+with N > 1 is refused at start until `SOP_SESSION_STORE` names a shared store:
+
+| Store | Shared by | Survives a restart | For |
+|---|---|---|---|
+| `memory` | one process | no | the demo, tests |
+| SQLite file | the workers and instances on one machine | yes | one machine |
+| PostgreSQL | instances on any number of machines | yes | production |
 
 ```bash
 SOP_SESSION_STORE=sqlite:///sessions.db python -m insurance_claims --workers 4   # ./sessions.db
@@ -443,24 +616,46 @@ SOP_SESSION_STORE=/data/sessions.db python -m insurance_claims --port 8001 &
 SOP_SESSION_STORE=/data/sessions.db python -m insurance_claims --port 8002 &
 # containers share it through a volume (the image's /data belongs to its user):
 docker run -d -p 8001:8000 -v sop-sessions:/data -e SOP_SESSION_STORE=/data/sessions.db sop-agent
-docker run -d -p 8002:8000 -v sop-sessions:/data -e SOP_SESSION_STORE=/data/sessions.db -e SOP_WORKERS=2 sop-agent
+# any number of machines, one database:
+docker run -d -p 8000:8000 -e SOP_SESSION_STORE=postgresql://sop:password@db.internal:5432/sop sop-agent
+# three containers, a load balancer and a PostgreSQL container in one go:
+docker compose -f docker-compose.ha.yml up --build --wait
 ```
 
-How the SQLite store keeps a conversation to one turn at a time across processes, and what a
-crash does, is in the docstring of `insurance_claims/store.py`. Its limits: one machine (keep the
-file on a local disk; network filesystems do not lock reliably), and one writer at a time (a turn
-writes twice), which is far more than the model allows but not unlimited. Each process has its
-own turn slots and counters, so N workers have N × `SOP_MAX_CONCURRENT_TURNS` slots in all.
+All three stores implement one interface (`insurance_claims/store/base.py`) and pass one set of
+tests. The two SQL stores share their logic and every statement (`store/sql.py`); the layout,
+the leases and the queue are described in
+[Scale and failure: the design](#scale-and-failure-the-design). What differs:
+
+- **SQLite**: one machine (keep the file on a local disk; network filesystems do not lock
+  reliably) and one writer at a time for all processes on the file. A turn's commit is a single
+  statement, so the file's write lock is held as briefly as possible.
+- **PostgreSQL**: a connection pool per process; the database's own clock decides leases and due
+  times, so the instances' clocks need not agree; the password is never logged; an unreachable
+  database fails operations fast (`503`) and the same processes carry on when it is back.
+
+Each process has its own turn slots and counters, so N instances have N × `SOP_MAX_CONCURRENT_TURNS`
+slots in all, and every one of them runs a dispatcher for the queued e-mails and handoffs.
 
 ### Watching it
 
-`GET /api/stats` reports, without any conversation content or identifiers: the store and the
-conversations it holds, turn slots in use and waiting, counters since start (conversations
-created, turns answered, `503`, `409`, `429`, `413`, model errors, conversations closed at the
-cap), the median and p95 latency of the last 1,000 turns, uptime and the process id. With the
-SQLite store the conversations held are the shared total; counters and latency are per process,
-and the response says so. Each turn also writes one log line, without message text or
-identifiers (the conversation id is cut to 8 characters, in the access log too):
+- `GET /healthz` is liveness: the process answers. `GET /readyz` is readiness: its session store
+  answers too (within about 2 s) and it is not shutting down; otherwise `503 not_ready`. A load
+  balancer should route by `/readyz`.
+- `GET /api/stats` reports, without any conversation content or identifiers: the store and the
+  conversations it holds, the queue of e-mails and handoffs (pending, sent, failed), turn slots
+  in use and waiting, counters since start (conversations created, turns answered, messages
+  replayed, `503`, `409`, `429`, `413`, model errors, conversations closed at the cap), the
+  median and p95 latency of the last 1,000 turns, the state of the model circuit breaker, what
+  the dispatcher delivered, retried and gave up on, uptime and the process id. With a shared
+  store the conversations and the queue are the shared totals; counters and latency are per
+  process, and the response says so.
+- `GET /api/sessions/{id}/audit` returns the conversation's audit events (what was decided,
+  never what was said) and the delivery status of its e-mails and handoff. With a SQL store it
+  still answers after the conversation itself has expired.
+
+Each turn also writes one log line, without message text or identifiers (the conversation id is
+cut to 8 characters, in the access log too):
 
 ```
 INFO:sop.turn:turn 1eddf222 phase=VERIFY_ID->PROCESS_CASE status=200 latency=2ms model_calls=3
@@ -474,8 +669,9 @@ or more running instances and checks every conversation, not just status codes: 
 the turn counter by exactly one, each conversation ends where its script says (verified on the
 right claim, email sent once or skipped, handed off), no reply names another policyholder's
 claim, reading a conversation back gives what the last turn returned, and eight messages sent at
-the same instant to one conversation are all answered, one at a time. It honours `Retry-After`
-like a client would and exits non-zero if any conversation went wrong. It refuses to run against
+the same instant to one conversation are all answered, one at a time. Every message carries a
+`message_id`, which is sent again with each retry of it. It honours `Retry-After` like a client
+would and exits non-zero if any conversation went wrong. It refuses to run against
 the live model; `scripts/live_check.py` is the small check for that
 ([below](#with-the-live-model)).
 
@@ -487,6 +683,7 @@ python scripts/load_test.py http://127.0.0.1:8021 --callers 400 --concurrency 10
 SOP_SESSION_STORE=/tmp/sessions.db python -m insurance_claims --mock --port 8021 &
 SOP_SESSION_STORE=/tmp/sessions.db python -m insurance_claims --mock --port 8022 &
 python scripts/load_test.py http://127.0.0.1:8021 http://127.0.0.1:8022 --callers 400 --concurrency 100
+# (the same with SOP_SESSION_STORE=postgresql://user:password@host:5432/db for PostgreSQL)
 
 # make the offline double as slow as the model, so the turn slots fill and 503 + Retry-After show
 SOP_MOCK_LATENCY_MS=1500 python -m insurance_claims --mock --port 8023 &
@@ -497,57 +694,62 @@ The offline double answers in about a millisecond, so without `SOP_MOCK_LATENCY_
 measures the harness itself (HTTP, store, engine) and the load generator on the same machine;
 with it, the turn slots and the waits behave as they would in front of the model.
 
-**Measured** with the commands above on a laptop (Intel i5-1245U, Windows, Python 3.14), server
-and load generator on the same machine, offline double:
+**Measured** with the commands above on a laptop (Intel i5-1245U, Windows, Python 3.14), server,
+database and load generator all on that one machine, offline double, on the version described
+here (2026-11-23):
 
 | Setup | Callers / at once | Conversations correct | Turns/s | Turn latency p50 / p95 | Asked to come back later |
 |---|---|---|---|---|---|
-| 1 process, memory store (7 runs) | 400 / 100 | 400 of 400, every run | 116–162 | 293–395 ms / 351–649 ms | 0 |
-| 2 processes, one SQLite file (2 runs) | 400 / 100 | 400 of 400, both runs | 172–224 | 288–358 ms / 577–847 ms | 0 |
-| 1 process, 2 workers, SQLite | 400 / 100 | 400 of 400 | 171 | 386 ms / 588 ms | 0 |
+| 1 process, memory store (2 runs) | 400 / 100 | 400 of 400, both runs | 186–212 | 207–227 ms / 244–355 ms | 0 |
+| 2 processes, one SQLite file (2 runs) | 400 / 100 | 400 of 400, both runs | 197–201 | 402–410 ms / 687–791 ms | 0 |
+| 2 processes, one PostgreSQL 16 database (2 runs) | 400 / 100 | 400 of 400, both runs | 120–129 | 426–432 ms / 821–876 ms | 0 |
 | 1 process, `SOP_MOCK_LATENCY_MS=1500`, within the slots | 120 / 60 | 120 of 120 | 13 | 3.0 s / 4.5 s | 0 |
-| 1 process, `SOP_MOCK_LATENCY_MS=1500`, over the slots | 200 / 150 | 200 of 200 | 16 | 4.6 s / 6.2 s | 304 × `503`, all answered on retry |
+| 1 process, `SOP_MOCK_LATENCY_MS=1500`, over the slots | 200 / 150 | 200 of 200 | 17 | 4.6 s / 6.2 s | 312 × `503`, all answered on retry |
 
 How to read it:
 
 - **Latency is what the caller sees, queueing included.** In the first row 100 callers send at
-  once to one process, and almost all of the 300–400 ms is waiting in line for it: on the server,
-  `/api/stats` showed a median of 2.5 ms and a p95 of 7.8 ms per turn. With SQLite (rows two and
-  three) part of the wait is for the file's single writer (server-side medians of 80–370 ms at
-  this load). In the last two rows the latency is the simulated model (two or three calls of
-  1.5 s) plus, over the slots, the wait for one.
-- **Absolute numbers moved with the machine.** The laptop's speed drifted by a factor of about
-  three during the day: the previous version of the server measured about 400 turns/s when the
-  machine was cool, and 127–142 turns/s later, in runs alternated with the 124–139 turns/s of
-  this version. Compare rows measured together.
-- **More processes help even here.** Two processes answered more turns per second than one,
-  although they share one SQLite writer, because the engine's own work then runs on two cores.
+  once to one process, and almost all of the 200 ms is waiting in line for it: on the server,
+  `/api/stats` showed a median of 1.6–2.0 ms and a p95 of 5.0–6.2 ms per turn. With SQLite most
+  of the wait is for the file's single writer (server-side medians of 280–350 ms at this load),
+  with PostgreSQL for the database and the connection pool (80–105 ms). In the last two rows the
+  latency is the simulated model (two or three calls of 1.5 s) plus, over the slots, the wait
+  for one.
+- **The first three rows are several times what a live model allows.** 64 turn slots with turns
+  of 4–7 s use 9–15 turns a second per process. The store is not what limits this service; the
+  model account is.
+- **PostgreSQL costs more per turn than SQLite here**, with the database on the same laptop: a
+  turn is about seven round trips to another process, against function calls into a local file.
+  It is what lets the instances run on different machines. In these runs every instance also
+  ran its dispatcher, which delivered the 400 summary e-mails (demo transport) from the same
+  store while the test went on.
+- **Absolute numbers move with the machine.** This laptop's speed drifts by a factor of about
+  three with its temperature (the same test has given 116 and 400 turns/s on one day). Compare
+  rows measured together, as these were.
 - **The slots do what they are for.** Within them nothing is refused and the latency is the
   model's. Over them, throughput stays at what 64 slots give (64 ÷ ~4 s ≈ 16 turns/s), the
   excess is told when to come back, and every conversation still ends correctly.
 
-Two more checks, done by hand:
+**An instance is killed in the middle** (`scripts/failover_test.py`: three instances on one
+store, 60 callers, each model call slowed to 350 ms so that turns are in flight, a turn lease of
+6 s; one instance is killed outright after 3 s and started again):
 
-- **A conversation outlives its instance.** With two instances on one SQLite file, a conversation
-  was verified on the first, the first was killed, and the second read it back (same phase, same
-  turn, same messages) and finished it through `POST_PROCESS`.
-- **Open conversations do not slow the server down.** 32,000 conversations were created by 16
-  threads (a tenth of them with one message), and after each quarter 200 single turns were timed
-  on fresh conversations. The same run against the previous version of the server, whose store
-  looked through every conversation on each write, is alongside:
+| Store | Conversations correct | Messages answered exactly once | In flight on the killed instance | Longest wait for one answer | Summary e-mails sent, once each |
+|---|---|---|---|---|---|
+| SQLite | 60 of 60 | 300 of 300 | 19 turns | 9.7 s | 60 of 60 |
+| PostgreSQL 16 | 60 of 60 | 300 of 300 | 20 turns | 9.7 s | 60 of 60 |
 
-  | Open conversations | New conversations/s | Turn p50 / p95 | Previous version: new conversations/s | Previous version: turn p50 / p95 |
-  |---|---|---|---|---|
-  | 200 | — | 8.0 ms / 11.7 ms | — | 8.0 ms / 11.0 ms |
-  | 8,400 | 271 | 7.1 ms / 11.1 ms | 184 | 12.1 ms / 17.2 ms |
-  | 16,600 | 265 | 8.3 ms / 15.3 ms | 97 | 14.1 ms / 18.1 ms |
-  | 24,800 | 272 | 8.1 ms / 13.0 ms | 87 | 11.3 ms / 21.3 ms |
-  | 33,000 | 263 | 8.4 ms / 12.9 ms | 65 | 16.9 ms / 25.4 ms |
+The callers whose turn died with the instance got a broken connection, sent the same message
+again with the same id, were told `409 conversation_busy` until the dead instance's lease had
+lapsed (6 s here, 20 s by default), and were then answered by another instance. Nothing was
+answered twice and nothing was lost; afterwards all three instances, the restarted one included,
+returned identical conversations.
 
-  The process grew from 106 MB to 199 MB (78 MB of it conversation state, as `/api/stats`
-  reports); the previous version reached 290 MB. Beyond `SOP_MAX_SESSIONS` or `SOP_MAX_STORE_MB`
-  the least recently used conversation is dropped: with a cap of 300, creating 500 more left 300
-  held, and the oldest answered `404`.
+Not measured again on this version: how the stores behave with tens of thousands of open
+conversations. The previous version was measured at 33,000 (about 8 ms a turn, unchanged from an
+empty store). For the SQL stores `test_store_split.py` checks instead, through SQLite's
+statement trace, that creating, reading and answering run no statement that looks at all
+conversations; expiry and eviction work in bounded batches in the background.
 
 ### With the live model
 
@@ -564,29 +766,60 @@ python scripts/live_check.py http://127.0.0.1:8000       # 12 callers at once, a
 # two workers on one SQLite file, and a cap small enough to reach
 SOP_SESSION_STORE=/tmp/live.db SOP_MAX_TURNS_PER_CONVERSATION=7 python -m insurance_claims --workers 2 --port 8031 &
 python scripts/live_check.py http://127.0.0.1:8031 --callers 8
+
+# an instance killed under live turns: three live instances on one database, started by hand
+python scripts/failover_test.py --urls http://127.0.0.1:8066,http://127.0.0.1:8067,http://127.0.0.1:8068 \
+    --callers 8 --lease 6 --kill-after 4 --wait-margin 30 --give-up 240 --kill-cmd "kill -9 <pid of one of them>"
 ```
 
 **Measured** on the same laptop with the default models (`claude-opus-5-5` for the replies,
-`claude-haiku-5-5` for the structured calls):
+`claude-haiku-5-5` for the structured calls), on 2026-11-23, on this version (after the storage
+and delivery rework):
 
 | Setup | Conversations at once | Conversations correct | Live turns | Took (one after another) | Turn time p50 / p95 | Model errors / `429` |
 |---|---|---|---|---|---|---|
-| 1 process, memory store | 12 | 12 of 12 | 60 | 32 s (358 s) | 6.3 s / 7.9 s | 0 / 0 |
-| 1 instance, 2 workers, SQLite | 8 | 8 of 8 | 40 | 34 s (251 s) | 6.6 s / 8.0 s | 0 / 0 |
+| 1 process, memory store | 12 | 12 of 12 | 60 | 35 s (392 s) | 6.8 s / 7.8 s | 0 / 0 |
+| 3 instances on one PostgreSQL, one of them killed 4.6 s in | 8 | 8 of 8 | 40, each answered once | 46 s | 7.5 s; longest wait 18.6 s | 0 / 0 |
 
 - **Twelve at once were no slower per turn than one caller alone**: the same five messages sent
-  by a single caller took 6.5, 6.0, 7.2, 3.2 and 7.1 s. The time is the model's.
+  by a single caller took 7.8, 7.2, 10.2, 4.1 and 6.7 s. The time is the model's.
 - **Four messages at the same instant to one conversation** were answered as turns 2, 3, 4 and 5,
-  none lost, in about 25 s in both setups. A live turn takes longer than
-  `SOP_CONVERSATION_WAIT_SECONDS`, so the waiting messages were told `409 conversation_busy` six
-  times in all and were answered on retry.
-- **With two workers, both answered** (21 and 31 turns). A conversation's messages went to
-  either of them, through the SQLite file.
+  none lost, in about 31 s. A live turn takes longer than `SOP_CONVERSATION_WAIT_SECONDS`, so the
+  waiting messages were told `409 conversation_busy` six times in all and were answered on retry.
+- **An instance killed while it was waiting for the model.** Three instances shared one
+  PostgreSQL with a turn lease of 6 s, shorter than a live turn, so every turn had its lease
+  renewed while the model was working. All eight callers were in their first turn when one
+  instance was killed; three of those turns were on it. Their callers got a broken connection,
+  sent the same message again with the same id, were told `409 conversation_busy` until the
+  dead instance's lease had lapsed, and were answered by another instance, 18.6 s after the
+  first attempt at the longest. No message was answered twice, none was lost, the finished
+  conversations read the same on both remaining instances, and all eight summary e-mails were
+  queued once and sent.
 - **With a cap of 7**, the seventh message was answered by the handoff to a human and the eighth
   with `409 conversation_closed`, which left the conversation as it was.
-- The same day, the 24 requirement checks (`scripts/spec_check.py`) and the ten scripted
-  scenarios (`scripts/run_scenarios.py`; 38 turns, median 4.0 s, p95 7.1 s) passed against the
-  live model.
+- **The 24 requirement checks** (`scripts/spec_check.py`, 22 live turns): 23 passed as written.
+  The 24th, "a clarification question is answered without advancing", failed on its word list
+  and not on the behaviour: the phase stayed `VERIFY_ID`, nothing was disclosed, and the reply
+  said the verification is there so that "only you, and not someone pretending to be you" can
+  see the claim, a phrasing the list did not have. The list was widened afterwards; the check
+  was not run again.
+- **The ten scripted scenarios** (`scripts/run_scenarios.py`; 38 turns, median 4.4 s, p95 7.6 s)
+  each ended where intended (verified, handed off, or still waiting for consent) and every
+  reply passed the output guard. After "Yes, please send it" the reply said the summary is "on
+  its way", which is what the delivery queue makes true.
+- **The model address failing, with the real SDK client.** No request reached the model service,
+  so this cost nothing. With nothing listening at the address, five messages were answered
+  `502 llm_error` after about 4.5 s each (two attempts per call); from the sixth on the answer
+  was `503 model_unavailable` with `Retry-After: 15`, at once. The conversation was unchanged
+  (turn 0, nothing kept) and `/readyz` stayed 200, since the instance itself was healthy. With
+  an address that accepts the connection and never answers, and a timeout of 5 s, each message
+  was answered `504` after 5.0 s. An outage of the real service (its own `5xx` or `529`
+  answers) was not observed; those paths are tested with made-up responses in
+  `test_llm_resilience.py`.
+
+Not run again on this version: the same check with two worker processes on one SQLite file
+(8 of 8 on 2026-11-22, on the previous version), and the requirement checks against the hosted
+demo.
 
 This checks that the server stays correct with several callers and the real model. It is not a
 load test: it went to 12 conversations at once, not to the 64 slots, so the capacity in
@@ -595,19 +828,23 @@ measured at the limit.
 
 ### What is not here, and would be for production
 
+- **A highly available database.** One PostgreSQL is a single point of failure. The application
+  is ready for a managed PostgreSQL with a standby and automatic failover (it reconnects by
+  itself and retries are safe), but no failover between database nodes was set up or tested.
+- **A second model provider or region.** A model outage is contained, not bridged.
 - **A load test with the live model up to the turn slots.** It would spend real credit and meet
   the account's rate limits first; the offline double with `SOP_MOCK_LATENCY_MS` stands in for it.
-
-- **A networked session store** (Redis or Postgres) for instances on several machines. The
-  interface is small and the record is plain JSON (`store.py` says how the lease maps onto each);
-  they are not included because they cannot be exercised here.
 - **Asynchronous model calls.** Each running turn holds a thread while it waits for the model;
   the async client would let one process keep far more turns in flight, with the slots still as
-  the bound.
+  the bound. Today the answer to more load is more instances.
 - **A gateway in front**: TLS, authentication, global rate limits and per-user quotas, and size
-  limits at the edge. The limiter here is per instance.
-- **Idempotent side effects.** Consent requests and the email are simulated; real ones need an
-  outbox or idempotency keys, because a failed turn is retried from the start.
+  limits at the edge. The limiter here is per instance, and a conversation id is all that is
+  needed to read a conversation back.
+- **Real receivers.** The SMTP and webhook transports were tested against local stand-ins only:
+  no TLS handshake with a real mail server, no real agent desk. Delivery is at least once, so a
+  receiver has to recognise a repeated idempotency key.
+- **Key rotation** for `SOP_DATA_KEY`, and encryption of the columns kept readable for queries
+  (phase, status, party id, delivery status and the audit trail).
 - **Metrics and tracing** (Prometheus, OpenTelemetry) and alerts. `/api/stats` is per process
   and in memory.
 - **Throttling failed verification per policyholder record** across conversations (see
@@ -645,28 +882,61 @@ The suite runs without a model:
   back — and how refusals and auth errors are handled.
 - `test_api.py` covers the HTTP contract, including that a failed model call leaves the
   conversation untouched so the message can be retried.
-- `test_store.py` holds both session stores to one contract: create, read, turn and commit,
-  nothing written when a turn fails, not found, expiry, the cap and its eviction order, the
-  bounded wait for a busy conversation, no lost update with many threads; for SQLite also two
-  store objects and a second operating-system process on one file, and a crashed worker's
-  lease lapsing with its late commit refused.
+- `test_store.py` holds the three session stores (memory, SQLite, PostgreSQL) to one contract:
+  create, read, turn and commit, nothing written when a turn fails, not found, expiry, the cap
+  and its eviction order, the bounded wait for a busy conversation, no lost update with many
+  threads, two store objects and a second operating-system process on one store.
+  `test_store_split.py` covers the layout (a turn appends rows and never rewrites the transcript,
+  the hot path does no work that grows with the number of conversations, the audit trail outlives
+  its conversation); `test_store_leases.py` the leases (renewal, a killed process's hold lapsing,
+  a late commit refused); `test_store_effects.py` the queue (claimed by one dispatcher at a time,
+  retried, set aside); `test_store_crypto.py` encryption at rest; `test_store_postgres.py` what is
+  particular to PostgreSQL (the pool, the redacted password, the database stopped and started
+  under a live store). The PostgreSQL tests need a server: `SOP_TEST_POSTGRES_URL`, or the
+  embedded one that `requirements-dev.txt` installs on Windows; without either they are skipped.
+- `test_audit.py` checks the audit trail: every decision leaves its event, events are only ever
+  appended, and none of them contains anything a caller said or any identifier value, over the
+  same random hostile conversations as `test_invariants.py`.
+- `test_idempotent_messages.py` covers `message_id`: a retry is answered from what is stored, by
+  another server process too; a retry racing the first attempt waits for it; the same id with
+  another text is refused; on all three stores.
+- `test_dispatch.py` runs the dispatcher against local receivers (`tests/sinks.py`: a small SMTP
+  server and a webhook server that can fail, hang and recover): retry then success, failed for
+  good after the attempts are used up, permanent failures, the redirect address, redelivery after
+  a lapsed claim, two dispatchers on one store, a store outage. `test_delivery_api.py` covers
+  what the API shows of it, `/readyz`, and a shutdown that lets turns finish within its grace
+  period and commits nothing of a turn it had to cut off.
+- `test_llm_resilience.py` covers the model failing: timeouts, the turn budget, the circuit
+  breaker opening, probing and closing, a bad key or a rate limit never opening it, and the
+  template reply when only the phrasing fails.
 - `test_serving.py` fills the turn slots with held turns and checks that health, config, stats,
   static files, reads and new conversations still answer at once while an extra turn gets `503`
   with `Retry-After`; it also covers `409`, `413` (declared and streamed), `429`, the message
   cap, `/api/stats`, the turn log, the refusal of several workers without a shared store, and
-  many conversations at once on threads with either store, compared with the same scripts run
-  one at a time.
+  many conversations at once on threads with the memory and the SQLite store, compared with the
+  same scripts run one at a time.
 - `test_hostile_http.py` sends malformed and extreme input (invalid JSON, wrong types, missing
   fields, 4,000- and 4,001-character messages, control characters and NUL, emoji, right-to-left
   text, lone surrogates, 7,000-deep JSON, huge and malformed conversation ids, unknown methods
-  and paths) with both stores: never a 5xx, always the envelope or a normal reply, and a refused
-  request changes nothing.
+  and paths) with the memory and the SQLite store: never a 5xx, always the envelope or a normal
+  reply, and a refused request changes nothing.
 
 `scripts/run_scenarios.py` is the live check: it plays ten scripted conversations (demo case,
 memory, frustration, refusal, mismatches, off-topic, representative, consent timeout, ambiguity,
 human request) against the real model and prints each reply with the harness decisions behind it.
 `scripts/live_check.py` does the same for several callers at once against a running instance
 ([With the live model](#with-the-live-model)).
+
+`scripts/failover_test.py` is the check for [failure recovery](#what-happens-when-something-fails):
+it starts three instances on one store, plays 60 conversations, kills one instance outright in the
+middle and starts it again, and then checks every transcript (each message answered exactly once,
+in order), the longest wait any caller had, that all instances show the same conversations, and
+that every summary e-mail was sent once.
+
+```bash
+python scripts/failover_test.py                                              # a temporary SQLite file
+python scripts/failover_test.py --store postgresql://user:password@host/db   # PostgreSQL
+```
 
 ### Checking the Docker image
 
@@ -679,8 +949,15 @@ container in model mode with no key (expects a clean `missing_api_key`), a third
 with no key (the hosted demo's configuration, which must answer offline and pass the same
 requirement checks), two more that share a SQLite session store on a volume (one with two
 workers) for a load test whose conversations alternate between them, checks that the image
-refuses several workers with the in-memory store, repeats the walk-through via
-`docker compose`, and runs the test suite inside `python:3.14-slim`.
+refuses several workers with the in-memory store, and repeats the walk-through via
+`docker compose`.
+
+A second job runs the test suite inside `python:3.14-slim` next to a PostgreSQL container, so the
+store tests cover all three stores there, and then the failover test on SQLite and on PostgreSQL.
+A third job starts `docker-compose.ha.yml` (three instances behind a load balancer on
+PostgreSQL), runs the requirement checks and the load test through the load balancer, kills one
+container in the middle of a failover run and starts it again, and finally stops and starts the
+database container to see the instances recover without a restart.
 
 The same walk-through by hand, against any running instance:
 
@@ -696,7 +973,7 @@ instance (`--mock`) and prints a PASS/FAIL line for each: no claim details befor
 two fields are not enough, partial answers add up, alternate fields, refusals, the hint remembered
 during `VERIFY_ID` and used afterwards, the demo case end to end, grounded answers, send and skip
 for the summary email, off-topic questions and the human offer, the frustrated caller. It can also be
-pointed at an instance running the live model (about 45 turns of API credit); the wording varies
+pointed at an instance running the live model (22 turns of API credit); the wording varies
 there, so read a FAIL with `-v` before believing it.
 
 ## Project layout
@@ -710,14 +987,20 @@ insurance_claims/
   tools.py             bounded tools with per-phase / per-caller authorisation
   understanding.py     schemas for the structured model calls
   prompts.py           system prompts and control-block rendering
-  llm.py               Claude backend (structured outputs, tool loop, refusal handling)
+  llm.py               Claude backend (structured outputs, tool loop, refusal handling, timeouts,
+                       turn budget, circuit breaker)
   mock_llm.py          offline test double
   replies.py           template wording for every directive
   guard.py             output checks (leak + grounding)
   agent.py             turn orchestrator
-  state.py             session state, its display-safe view and its JSON record
-  store.py             session stores: in memory, or a SQLite file shared by processes
-  server.py            FastAPI app and API: turn slots, limits, error envelope, /api/stats
+  state.py             session state, its audit events, its display-safe view and its JSON record
+  store/               session stores behind one interface: memory, SQLite, PostgreSQL
+    base.py              the interface: conversations, turns, audit trail, queue of effects
+    sql.py               what the two SQL stores share: layout, statements, leases, sweeps
+    sqlite.py postgres.py memory.py crypto.py
+  dispatch.py          delivery of queued e-mails and handoffs: dispatcher, SMTP and webhook
+  server.py            FastAPI app and API: turn slots, limits, idempotent messages, error
+                       envelope, /readyz, /api/stats, the audit endpoint
   static/              the test UI (plain HTML/CSS/JS, no build step)
 SUBMISSION.md                one-page cover note for reviewers
 render.yaml                  Render Blueprint for a hosted copy of the demo
@@ -725,8 +1008,10 @@ scripts/run_scenarios.py     scripted conversations against the live model (or o
 scripts/docker_smoke.py      HTTP walk-through of the demo case against a running container
 scripts/spec_check.py        the brief, requirement by requirement, against an offline instance
 scripts/load_test.py         many simulated callers against running instances, each conversation checked
+scripts/failover_test.py     kills one of three instances mid-run and checks every conversation
+docker-compose.ha.yml        three instances behind a load balancer (deploy/Caddyfile) on PostgreSQL
 scripts/live_check.py        several callers at once against an instance on the live model
-.github/workflows/docker.yml image build + container checks + test suite on Linux
+.github/workflows/docker.yml image build + container checks; tests with PostgreSQL; failover; the three-instance setup
 tests/
 ```
 
@@ -738,24 +1023,30 @@ tests/
 - **Representatives and consent** are inferred from `representatives.json` and
   `consent_scenarios.json`: a listed representative plus policyholder consent, on top of the
   same 3-of-5 rule. Consent is polled once per caller turn; `timeout` gives up after three checks.
-- **Email** goes only to the address on file, shown masked. The "send" is simulated: the message
-  lands in an in-memory outbox displayed in the UI.
-- **Human transfer** is simulated: the conversation is closed and a handoff summary is produced.
+- **Email** goes only to the address on file, shown masked. It is queued with the turn and
+  delivered by the dispatcher; the UI shows it with its delivery status. By default the transport
+  is the demo one, which sends nothing: the brief does not ask for a mail system, and its own
+  fixtures simulate the consent service the same way. An SMTP transport is included for a real one.
+- **Human transfer** works the same way: the conversation is closed, a handoff summary is
+  produced and queued, and the demo transport delivers it nowhere. A webhook transport is
+  included for a real agent desk.
 - **Sessions** are in memory by default (lost on restart), capped in number, size and idle time.
-  `SOP_SESSION_STORE` switches to a SQLite file that the workers and instances on one machine
-  share and that survives a restart; Redis or Postgres would implement the same small interface
-  for several machines ([Scaling and limits](#scaling-and-limits)).
+  `SOP_SESSION_STORE` switches to a SQLite file (one machine) or a PostgreSQL database (any
+  number of machines); see [Scale and failure: the design](#scale-and-failure-the-design).
 - **Verification feedback.** The agent tells the caller which identifiers matched and which did
   not (by field name). That is what makes partial answers and corrections feel natural, and it
   is what a human representative does, but it does confirm a correct guess. Strikes are counted
   per conversation; a production deployment should also throttle failed attempts per record
   across conversations. Switching to generic "I couldn't verify that yet" feedback is a small
   change in `prompts._section` and `replies._core` if the stricter posture is preferred.
-- **Side effects.** Consent requests and the email are simulated and recorded in the session.
-  With real services they should be made idempotent (or queued in an outbox), because a turn
-  whose reading fails is retried from the start.
-- **Trace hygiene.** Identifier values are kept out of the state view and trace; the raw
-  transcript necessarily contains whatever the caller typed.
+- **Side effects.** The e-mail and the handoff leave through the queue described above, so a
+  retried turn cannot send twice and a crash cannot lose one. The consent request to the
+  policyholder is still simulated inside the turn (from `consent_scenarios.json`); a real consent
+  service would be called through the same queue.
+- **Personal data.** Identifier values are kept out of the state view, the trace and the audit
+  trail, and are dropped from the stored state once the caller is verified. The transcript
+  necessarily contains whatever the caller typed; with a SQL store it can be encrypted at rest
+  (`SOP_DATA_KEY`) and it expires with the conversation.
 - The Test data drawer and `/api/fixtures` exist to make evaluation easy; turn them off with
   `SOP_EXPOSE_FIXTURES=0`.
 

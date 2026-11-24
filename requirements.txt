@@ -2,3 +2,6 @@ anthropic>=2.12,<3
 fastapi>=0.115
 uvicorn>=0.30
 pydantic>=2.7
+# Session store: PostgreSQL (SOP_SESSION_STORE=postgresql://...) and encryption at rest (SOP_DATA_KEY)
+psycopg[binary,pool]>=3.2
+cryptography>=42

@@ -6,7 +6,7 @@
 Standard library only. Each check reads the session state the API returns (phase, matched fields,
 memory, selected claim, outbox, strikes) and, where the requirement is about what the agent says,
 looks for a few loose words in the reply. It is meant for an offline instance (`SOP_LLM_MODE=mock`),
-where the replies are fixed. Against the live model it costs about 45 turns of API credit and the
+where the replies are fixed. Against the live model it costs 22 turns of API credit and the
 wording varies, so read a FAIL there with -v before believing it. Exits non-zero if any check fails.
 """
 from __future__ import annotations
@@ -23,7 +23,8 @@ DEMO = ("I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm ca
 CLAIM_DETAIL = re.compile(r"CL-\d+|pathology|office note|appeal deadline|March 18|was denied because", re.I)
 # Loose word lists: the offline replies are fixed, the live model's are not.
 EMPATHY = re.compile(r"sorry|apolog|understand|frustrat|hear you|stressful|upsetting", re.I)
-WHY_VERIFY = re.compile(r"protect|privacy|private|secur|safe|personal|confidential|authori[sz]|no one else", re.I)
+WHY_VERIFY = re.compile(r"protect|privacy|private|secur|safe|personal|confidential|authori[sz]|no one else|only you|"
+                        r"someone else|pretending|impersonat", re.I)
 ID_OPTIONS = re.compile(r"name|date of birth|phone|email|SSN", re.I)
 SUBMISSION = re.compile(r"pathology|portal|upload|fax|mail", re.I)
 results: list[tuple[str, bool, str]] = []

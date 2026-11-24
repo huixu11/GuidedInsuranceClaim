@@ -1,0 +1,30 @@
+# Load balancer for docker-compose.ha.yml: plain HTTP on :8080 in front of three instances.
+{
+	admin off
+	auto_https off
+}
+
+:8080 {
+	reverse_proxy app1:8000 app2:8000 app3:8000 {
+		# Any instance can answer any conversation, so there is no stickiness to configure.
+		lb_policy least_conn
+
+		# Active checks: an instance gets traffic only while its /readyz answers 200 (the
+		# process is up and reaches the database).
+		health_uri /readyz
+		health_interval 2s
+		health_timeout 3s
+
+		# Passive checks: an instance that refuses connections is left out for 10 s at once,
+		# without waiting for the next active check.
+		max_fails 1
+		fail_duration 10s
+
+		# A request that could not be handed to an instance is tried on another one for up to
+		# 5 s. Only requests that were not sent yet are retried this way: a message that had
+		# reached an instance before it died gets a 502 here and is sent again by the client
+		# with the same message_id, which the next instance answers exactly once.
+		lb_try_duration 5s
+		lb_try_interval 250ms
+	}
+}

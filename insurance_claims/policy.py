@@ -9,10 +9,15 @@ facts the LLM is allowed to use while phrasing it.
 The LLM is consulted from here only through two bounded, validated calls
 (`backend.resolve` to pick one of the caller's own claims and a workflow path,
 `backend.summarize` to draft the email summary).
+
+Each decision is also written to the audit trail (`SessionState.audit`, event types in
+`state.AUDIT_EVENTS`) once, when it is taken: ids, field names, counts and fixed codes only.
 """
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 from dataclasses import dataclass, field
 from typing import Any, Protocol
 
@@ -57,6 +62,18 @@ ESCALATION_REASONS = {
     "turn_limit": "the conversation reached the maximum number of messages for one chat",
 }
 
+# Why a human is offered: the code the audit trail records -> the words the reply is given.
+HUMAN_OFFER_REASONS = {
+    "offer_still_open": "the earlier offer is still open",
+    "repeated_out_of_scope": "repeated questions outside claims support",
+    "sustained_upset": "the caller has been upset for several turns",
+    "reluctant_to_verify": "the caller is reluctant to verify",
+    "representative_not_on_file": "representative is not authorized on file",
+    "consent_timed_out": "policyholder consent was not received in time",
+    "cannot_complete_verification": "not enough identifiers left to complete verification",
+    "claim_unclear": "could not determine which claim the caller means",
+}
+
 
 @dataclass
 class Modifiers:
@@ -69,6 +86,13 @@ class Modifiers:
     offer_human: bool = False
     offer_human_reason: str | None = None
     ambiguous_yes: bool = False  # "yes" right after a human was offered next to another question
+    offer_human_code: str | None = None  # the HUMAN_OFFER_REASONS key, for the audit trail only
+
+    def offer(self, code: str) -> None:
+        """Offer a human representative in this reply, for the reason `code`."""
+        self.offer_human = True
+        self.offer_human_reason = HUMAN_OFFER_REASONS[code]
+        self.offer_human_code = code
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -156,8 +180,7 @@ def step(
     ):
         ctx.ambiguous_yes = True
         ctx.mods.ambiguous_yes = True
-        ctx.mods.offer_human = True
-        ctx.mods.offer_human_reason = "the earlier offer is still open"
+        ctx.mods.offer("offer_still_open")
         trace.add("gate", "ambiguous yes after a human was offered — asking which was meant", None)
 
     stop = _track_guardrails(ctx)
@@ -196,6 +219,7 @@ def close_at_turn_limit(
         "handing off instead of continuing",
         None,
     )
+    state.audit("turn_limit_reached", limit=settings.max_turns_per_conversation)
     directive = _escalate(ctx, "turn_limit")
     directive.deterministic = True
     return _finish(ctx, directive)
@@ -207,6 +231,8 @@ def _finish(ctx: Ctx, directive: Directive) -> Directive:
         ctx.mods.offer_human = False  # nothing left to offer once closed or handed off
     directive.mods = ctx.mods
     state.human_offer_pending = ctx.mods.offer_human
+    if ctx.mods.offer_human:  # this reply offers a human representative
+        state.audit("human_offered", reason=ctx.mods.offer_human_code)
     ctx.trace.add(
         "directive",
         directive.action,
@@ -254,6 +280,7 @@ def _remember(ctx: Ctx) -> None:
                     "consent still required",
                     None,
                 )
+                s.audit("role_change_ignored", kept_role="representative")
             elif s.caller_role != "policyholder":
                 s.caller_role = "policyholder"
                 stored["caller_role"] = "policyholder"
@@ -330,11 +357,12 @@ def _track_guardrails(ctx: Ctx) -> Directive | None:
                 f"total {s.oos_total})"
             )
         ctx.trace.add("gate", label, {"topic": mods.decline_topic})
+        # (the topic is the model's own words: not recorded)
+        s.audit("out_of_scope", scope=u.scope, consecutive=s.oos_consecutive, total=s.oos_total, limit=limit)
         if s.oos_consecutive > limit or s.oos_total > 2 * limit:
             return _escalate(ctx, "repeated_out_of_scope")
         if s.oos_consecutive == limit or s.oos_total == 2 * limit:
-            mods.offer_human = True
-            mods.offer_human_reason = "repeated questions outside claims support"
+            mods.offer("repeated_out_of_scope")
 
     # Emotion
     s.emotion_label, s.emotion_intensity = u.emotion, u.intensity
@@ -343,8 +371,7 @@ def _track_guardrails(ctx: Ctx) -> Directive | None:
     if u.emotion not in {"neutral", "positive"} and u.intensity >= 1:
         mods.empathy = (u.emotion, u.intensity)
     if s.elevated_streak >= cfg.elevated_emotion_offer_streak:
-        mods.offer_human = True
-        mods.offer_human_reason = "the caller has been upset for several turns"
+        mods.offer("sustained_upset")
     if u.asks_why:
         mods.explain_why = True
     return None
@@ -353,7 +380,8 @@ def _track_guardrails(ctx: Ctx) -> Directive | None:
 # ---------------------------------------------------------------------------
 # Transitions and escalation
 # ---------------------------------------------------------------------------
-def _transition(ctx: Ctx, dst: Phase, reason: str) -> None:
+def _transition(ctx: Ctx, dst: Phase, reason: str, code: str) -> None:
+    """Move to `dst`; `reason` is shown in the phase history, `code` goes into the audit trail."""
     s = ctx.state
     src = s.phase
     sop.check_transition(s, dst, ctx.tools.owned_case_ids())  # raises SOPViolation if illegal
@@ -365,6 +393,17 @@ def _transition(ctx: Ctx, dst: Phase, reason: str) -> None:
     s.phase_history.append({"turn": s.turn, "from": src.value, "to": dst.value, "reason": reason})
     ctx.entered.add(dst)
     ctx.trace.add("transition", f"{src.value} → {dst.value} ({reason})", None)
+    s.audit("phase_changed", **{"from": src.value, "to": dst.value, "reason": code})
+
+
+def _closed(s: SessionState, reason: str) -> None:
+    """Record that the conversation just ended; `s.status` (completed or escalated) says how."""
+    s.audit("conversation_closed", status=s.status, reason=reason, verified=s.verified, phase=s.phase.value)
+
+
+def _reopened(s: SessionState, reason: str) -> None:
+    """Record that a completed conversation was made active again."""
+    s.audit("conversation_reopened", reason=reason, phase=s.phase.value)
 
 
 def build_handoff_summary(s: SessionState, reason: str, settings: Settings) -> str:
@@ -410,6 +449,8 @@ def _escalate(ctx: Ctx, reason: str) -> Directive:
         "handoff_summary": build_handoff_summary(s, reason, ctx.settings),
     }
     ctx.trace.add("escalation", f"escalated to a human: {ESCALATION_REASONS.get(reason, reason)}", None)
+    s.audit("escalated", reason=reason, verified=s.verified, phase=s.phase.value)
+    _closed(s, reason)
     return Directive(
         ESCALATE,
         {
@@ -429,19 +470,33 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
     if u.wants_to_end and not ctx.new_identity:
         s.status = STATUS_COMPLETED
         ctx.trace.add("gate", "caller ended the conversation before verification", None)
+        _closed(s, "ended_before_verification")
         return Directive(CLOSE_UNVERIFIED)
 
     previously_matched = {f for f in PII_FIELDS if s.field_status.get(f) == MATCHED}
+    previous_result = (s.field_status, s.policy_status, s.candidate_party_id)
     result = tools.verify_identity()
     s.field_status = dict(result.field_status)
     s.policy_status = result.policy_status
     s.candidate_party_id = result.party_id
+    if (s.field_status, s.policy_status, s.candidate_party_id) != previous_result:
+        s.audit(
+            "identity_checked",
+            matched_fields=result.matched,
+            mismatched_fields=result.mismatched,
+            matched_count=result.matched_count,
+            policy_number_status=result.policy_status,
+            candidate_party_id=result.party_id,
+        )
 
-    # Strike accounting: one strike per turn that introduces a new non-matching value.
+    # Strike accounting: one strike per turn that introduces a new non-matching value. Values
+    # are compared by keyed digest, so the wrong values themselves are not kept in the state.
+    if any("=" in key for key in s.seen_mismatches):  # kept in clear by an earlier version
+        s.seen_mismatches = [_mismatch_key(s.session_id, k) if "=" in k else k for k in s.seen_mismatches]
     new_mismatch: list[str] = []
     for f in result.mismatched:
         raw = s.identity_claims.get(f, "")
-        key = f"{f}={identity.normalize(f, raw) or raw.strip().lower()}"
+        key = _mismatch_key(s.session_id, f"{f}={identity.normalize(f, raw) or raw.strip().lower()}")
         if key not in s.seen_mismatches:
             s.seen_mismatches.append(key)
             new_mismatch.append(f)
@@ -451,6 +506,12 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
             "gate",
             f"identifier mismatch — failed attempt {s.failed_attempts}/{cfg.max_failed_attempts}",
             {"mismatched": result.mismatched},
+        )
+        s.audit(
+            "verification_strike",
+            fields=new_mismatch,
+            failed_attempts=s.failed_attempts,
+            max_failed_attempts=cfg.max_failed_attempts,
         )
         if s.failed_attempts >= cfg.max_failed_attempts:
             return _escalate(ctx, "verification_failed")
@@ -462,6 +523,12 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
     progressed = bool(set(result.matched) - previously_matched) or bool(new_mismatch)
     if u.refusal in {"identity_info", "consent"} and not progressed:
         s.refusal_count += 1
+        s.audit(
+            "verification_refusal",
+            refusal=u.refusal,
+            refusal_count=s.refusal_count,
+            max_persuasion_attempts=cfg.max_persuasion_attempts,
+        )
         if s.refusal_count > cfg.max_persuasion_attempts:
             ctx.trace.add(
                 "gate",
@@ -478,8 +545,7 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
         )
         mods.explain_why = True
         if s.refusal_count >= cfg.max_persuasion_attempts:
-            mods.offer_human = True
-            mods.offer_human_reason = "the caller is reluctant to verify"
+            mods.offer("reluctant_to_verify")
 
     matched_count = result.matched_count
     is_rep = s.caller_role == "representative"
@@ -500,20 +566,24 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
                 s.rep_on_file = None
             if s.rep_on_file is None:
                 s.rep_on_file = bool(tools.lookup_representative(result.party_id)["on_file"])
+                if not s.rep_on_file:  # (the representative's name is not recorded)
+                    s.audit("consent_result", party_id=result.party_id, result="not_on_file", polls=s.consent_polls)
             if not s.rep_on_file:
-                mods.offer_human = True
-                mods.offer_human_reason = "representative is not authorized on file"
+                mods.offer("representative_not_on_file")
                 ctx.trace.add("gate", "representative not on file — cannot proceed without the policyholder", None)
                 return Directive(REP_NOT_ON_FILE, {"rep_name": s.rep_name})
+            consent_before = s.consent_status
             if s.consent_status in {"not_required", "not_requested"}:
                 s.consent_status = tools.request_consent()
+                s.audit("consent_requested", party_id=s.consent_party_id, channel="text_to_phone_on_file")
                 if s.consent_status == "pending":
                     return Directive(CONSENT_REQUESTED, {"rep_first_name": _first(s.rep_name)})
             elif s.consent_status == "pending":
                 s.consent_status = tools.check_consent_status()
+            if s.consent_status != consent_before and s.consent_status in {"approved", "timed_out"}:
+                s.audit("consent_result", party_id=s.consent_party_id, result=s.consent_status, polls=s.consent_polls)
             if s.consent_status == "timed_out":
-                mods.offer_human = True
-                mods.offer_human_reason = "policyholder consent was not received in time"
+                mods.offer("consent_timed_out")
                 ctx.trace.add("gate", "consent timed out — claim details stay locked", None)
                 return Directive(CONSENT_TIMEOUT, {})
             if s.consent_status != "approved":
@@ -529,10 +599,39 @@ def _handle_verify(ctx: Ctx) -> Directive | None:
             + (" + policyholder consent" if is_rep else ""),
             {"matched": result.matched},
         )
-        _transition(ctx, Phase.RESOLVE_INTENT, "identity verified")
+        s.audit(
+            "identity_verified",
+            party_id=result.party_id,
+            caller_role=s.caller_role,
+            matched_fields=result.matched,
+            matched_count=matched_count,
+            required_matches=cfg.required_id_matches,
+            identifier_values_cleared=True,  # just below
+        )
+        _forget_identifier_values(s)
+        _transition(ctx, Phase.RESOLVE_INTENT, "identity verified", "identity_verified")
         return None
 
     return Directive(REQUEST_IDENTITY, _identity_facts(ctx, result, new_mismatch))
+
+
+def _forget_identifier_values(s: SessionState) -> None:
+    """Drop the identifier values the caller typed, and the digests of the wrong ones, once
+    identity is verified. Only verification reads them, and VERIFY_ID is never entered again
+    (nor does `_remember` store identifiers for a verified caller); what they established is
+    kept: field_status, policy_status, party_id, failed_attempts and the audit trail. The
+    transcript still holds them as typed."""
+    s.identity_claims = {}
+    s.seen_mismatches = []
+
+
+def _mismatch_key(session_id: str, plain: str) -> str:
+    """'dob=1985-03-16' -> 'dob:<16 hex digits>': an HMAC-SHA256 of the normalised wrong value,
+    keyed with the session id. Equal values give equal keys within one conversation, so a
+    repeat is still told from a new value, while the value itself is not kept."""
+    field_name = plain.split("=", 1)[0]
+    digest = hmac.new(session_id.encode(), plain.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{field_name}:{digest}"
 
 
 def _bind_consent(s: SessionState, party_id: str, rep_key: str) -> None:
@@ -560,8 +659,7 @@ def _identity_facts(
     reachable = result.matched_count + len(still_open) + len(result.mismatched)
     can_reach = reachable >= cfg.required_id_matches
     if not can_reach:
-        ctx.mods.offer_human = True
-        ctx.mods.offer_human_reason = "not enough identifiers left to complete verification"
+        ctx.mods.offer("cannot_complete_verification")
     noted = None
     if ctx.new_hints or (ctx.state.intent and ctx.state.intent.captured_turn == s.turn):
         noted = s.hint_summary() or None
@@ -595,7 +693,7 @@ def _handle_resolve(ctx: Ctx) -> Directive | None:
     claims = tools.list_claims()
 
     if u.wants_to_end and not entered_now:
-        _transition(ctx, Phase.POST_PROCESS, "caller has nothing further")
+        _transition(ctx, Phase.POST_PROCESS, "caller has nothing further", "caller_finished")
         return None
 
     base = {
@@ -643,6 +741,10 @@ def _handle_resolve(ctx: Ctx) -> Directive | None:
             **({"llm": meta} if meta else {}),
         },
     )
+    if rejected:
+        # The model's pick is its own text: recorded only as the number of a claim that exists.
+        known = ctx.repo.claim(rejected)
+        s.audit("claim_choice_rejected", case_id=known["case_id"] if known else None, reason="not_on_account")
 
     if case_id:
         chosen = next(c for c in claims if c["case_id"] == case_id)
@@ -655,14 +757,14 @@ def _handle_resolve(ctx: Ctx) -> Directive | None:
         s.candidates = []
         s.clarify_attempts = 0
         ctx.just_resolved = True
-        _transition(ctx, Phase.PROCESS_CASE, f"claim {case_id} selected")
+        s.audit("claim_selected", case_id=case_id, path=intent)
+        _transition(ctx, Phase.PROCESS_CASE, f"claim {case_id} selected", "claim_selected")
         return None
 
     s.candidates = candidates
     s.clarify_attempts += 1
     if s.clarify_attempts > cfg.max_clarify_attempts:
-        ctx.mods.offer_human = True
-        ctx.mods.offer_human_reason = "could not determine which claim the caller means"
+        ctx.mods.offer("claim_unclear")
     return Directive(
         CLARIFY_CASE,
         {**base, "candidates": candidates, "remembered": _remembered(ctx)},
@@ -680,10 +782,10 @@ def _handle_process(ctx: Ctx) -> Directive | None:
         if u.wants_different_claim:
             s.selected_case_id = None
             s.case_intent = None
-            _transition(ctx, Phase.RESOLVE_INTENT, "caller asked about a different claim")
+            _transition(ctx, Phase.RESOLVE_INTENT, "caller asked about a different claim", "different_claim")
             return None
         if u.wants_to_end:
-            _transition(ctx, Phase.POST_PROCESS, "caller has no further questions")
+            _transition(ctx, Phase.POST_PROCESS, "caller has no further questions", "caller_finished")
             return None
         if u.intent != "none":
             s.case_intent = u.intent
@@ -727,6 +829,8 @@ def _handle_post(ctx: Ctx) -> Directive | None:
         s.email_offered = True
         s.email_reasks += 1
         ctx.trace.add("gate", "summary requested to a different address — not sent; asking again", None)
+        # (the other address is never recorded)
+        s.audit("email_other_address_declined", reasks=s.email_reasks, max_reasks=cfg.max_email_reasks)
         if s.email_reasks >= cfg.max_email_reasks:
             return _skip_email(ctx, email_facts, defaulted=True)
         return Directive(
@@ -744,6 +848,7 @@ def _handle_post(ctx: Ctx) -> Directive | None:
         # The offer is always made here. If the caller already said what they would like
         # earlier in the call, that is remembered and mentioned, and they still choose.
         pref = s.email_pref.value if s.email_pref else None
+        s.audit("email_offered", remembered_preference=pref)
         return Directive(OFFER_EMAIL, {**email_facts, "remembered_preference": pref, "reask": False})
 
     if choice == "none" and u.yes_no in {"yes", "no"} and not ctx.ambiguous_yes:
@@ -762,15 +867,15 @@ def _handle_post(ctx: Ctx) -> Directive | None:
         s.email_offered = False
         s.selected_case_id = None
         s.case_intent = None
-        _transition(ctx, Phase.RESOLVE_INTENT, "caller raised another claim")
+        _transition(ctx, Phase.RESOLVE_INTENT, "caller raised another claim", "different_claim")
         return None
     if u.intent != "none":
         s.email_offered = False
         if s.selected_case_id:
             s.case_intent = u.intent
-            _transition(ctx, Phase.PROCESS_CASE, "caller has a follow-up question")
+            _transition(ctx, Phase.PROCESS_CASE, "caller has a follow-up question", "follow_up")
         else:
-            _transition(ctx, Phase.RESOLVE_INTENT, "caller has a claim question")
+            _transition(ctx, Phase.RESOLVE_INTENT, "caller has a claim question", "claim_question")
         return None
 
     s.email_reasks += 1
@@ -784,6 +889,7 @@ def _send_email(ctx: Ctx, facts: dict[str, Any]) -> Directive:
     s = ctx.state
     s.email_decision = "send"
     ctx.trace.add("gate", "caller agreed to the email summary", None)
+    s.audit("email_decision", decision="send", defaulted=False)
     records = []
     for case_id in s.cases_discussed:
         try:
@@ -810,6 +916,8 @@ def _send_email(ctx: Ctx, facts: dict[str, Any]) -> Directive:
         if problems:
             s.guard_blocks += 1
             ctx.trace.add("guard", "drafted summary rejected — email built from the records instead", problems)
+            s.audit("guard_blocked", target="email_summary", rules=guard.rule_names(problems),
+                    outcome="built_from_records")
             summary = fallback
     holder = ctx.repo.policyholder(s.party_id)
     body = render_email_body(summary, holder.first_name if holder else "", ctx.settings)
@@ -821,8 +929,18 @@ def _send_email(ctx: Ctx, facts: dict[str, Any]) -> Directive:
         s.email_decision = None
         ctx.trace.add("error", f"email not sent: {exc}", None)
         s.status = STATUS_COMPLETED
+        _closed(s, "email_not_sent")
         return Directive(EMAIL_SKIPPED, {**facts, "send_failed": True})
+    # What went where, without the address or the content: the claims it covers, and whether
+    # its text is the model's (guarded) draft or built from the records.
+    s.audit(
+        "email_queued",
+        recipient="address_on_file",
+        case_ids=[r["case_id"] for r in records],
+        summary_source="records" if summary is fallback else "drafted",
+    )
     s.status = STATUS_COMPLETED
+    _closed(s, "email_sent")
     return Directive(
         EMAIL_SENT,
         {
@@ -845,6 +963,8 @@ def _skip_email(ctx: Ctx, facts: dict[str, Any], defaulted: bool = False) -> Dir
         "email summary skipped" + (" (no clear answer — default is not to send)" if defaulted else ""),
         None,
     )
+    s.audit("email_decision", decision="skip", defaulted=defaulted)
+    _closed(s, "email_skipped")
     return Directive(EMAIL_SKIPPED, {**facts, "defaulted": defaulted})
 
 
@@ -935,6 +1055,7 @@ def _handle_completed(ctx: Ctx) -> Directive | None:
     if not s.verified:
         if ctx.new_identity or u.has_claim_reference:
             s.status = STATUS_ACTIVE
+            _reopened(s, "resumed_verification")
             return None  # back into VERIFY_ID
         return Directive(CLOSED, {"verified": False})
     if (
@@ -945,6 +1066,7 @@ def _handle_completed(ctx: Ctx) -> Directive | None:
     ):
         # Changed their mind after skipping: an explicit request for the summary is honoured.
         s.status = STATUS_ACTIVE
+        _reopened(s, "email_requested")
         holder = ctx.repo.policyholder(s.party_id)
         return _send_email(
             ctx,
@@ -956,17 +1078,18 @@ def _handle_completed(ctx: Ctx) -> Directive | None:
         )
     if s.phase == Phase.POST_PROCESS and (u.wants_different_claim or u.has_claim_reference):
         s.status = STATUS_ACTIVE
+        _reopened(s, "claim_question")
         s.email_offered = False
         s.email_decision = None
         s.email_reasks = 0
         if s.selected_case_id and not u.wants_different_claim and not u.hints:
             if u.intent != "none":
                 s.case_intent = u.intent
-            _transition(ctx, Phase.PROCESS_CASE, "caller came back with a follow-up")
+            _transition(ctx, Phase.PROCESS_CASE, "caller came back with a follow-up", "follow_up")
         else:
             s.selected_case_id = None
             s.case_intent = None
-            _transition(ctx, Phase.RESOLVE_INTENT, "caller came back about another claim")
+            _transition(ctx, Phase.RESOLVE_INTENT, "caller came back about another claim", "different_claim")
         return None
     return Directive(CLOSED, {"verified": True, "caller": _caller_facts(ctx)})
 

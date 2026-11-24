@@ -359,13 +359,13 @@ def _section(action: str, f: dict[str, Any], state: SessionState, settings: Sett
     elif action == P.EMAIL_SENT:
         s = f["summary"]
         out += [
-            f"situation: the caller agreed, and the summary email has been sent to {f['sent_to']} "
-            f"(subject: {f['subject']}).",
+            f"situation: the caller agreed, and the summary email is queued for delivery to "
+            f"{f['sent_to']} (subject: {f['subject']}); it goes out within moments.",
             "it covers:",
             *[f"- discussed: {b}" for b in s["discussed"]],
             f"- status: {s['claim_status']}",
             *[f"- next step: {b}" for b in s["next_steps"]],
-            "this reply must: confirm it was sent (masked address), mention the single most important "
+            "this reply must: confirm it is on its way (masked address), mention the single most important "
             "next step if there is one, and close warmly. Short. No further questions.",
         ]
     elif action == P.EMAIL_SKIPPED:

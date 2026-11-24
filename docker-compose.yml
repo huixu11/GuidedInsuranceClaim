@@ -1,3 +1,4 @@
+# One instance. For several instances behind a load balancer on PostgreSQL, see docker-compose.ha.yml.
 services:
   sop-agent:
     build: .
@@ -15,7 +16,8 @@ services:
       SOP_TODAY: ${SOP_TODAY:-2026-03-02}
       SOP_EXPOSE_FIXTURES: ${SOP_EXPOSE_FIXTURES:-1}
       # Serving (README, "Scaling and limits"). Default: one worker, conversations in memory.
-      # More than one worker needs the shared store, e.g. SOP_SESSION_STORE=/data/sessions.db.
+      # More than one worker needs a shared store: SOP_SESSION_STORE=/data/sessions.db (SQLite on the
+      # volume below) or postgresql://user:password@host:5432/db.
       SOP_WORKERS: ${SOP_WORKERS:-1}
       SOP_SESSION_STORE: ${SOP_SESSION_STORE:-memory}
       # Limits; left empty, each takes its built-in default.
@@ -27,12 +29,30 @@ services:
       SOP_TURN_SLOT_WAIT_SECONDS: ${SOP_TURN_SLOT_WAIT_SECONDS:-}
       SOP_CONVERSATION_WAIT_SECONDS: ${SOP_CONVERSATION_WAIT_SECONDS:-}
       SOP_TURN_LEASE_SECONDS: ${SOP_TURN_LEASE_SECONDS:-}
+      SOP_STORE_POOL_SIZE: ${SOP_STORE_POOL_SIZE:-}
+      SOP_DATA_KEY: ${SOP_DATA_KEY:-}
+      SOP_AUDIT_RETENTION_DAYS: ${SOP_AUDIT_RETENTION_DAYS:-}
+      SOP_MODEL_TIMEOUT_SECONDS: ${SOP_MODEL_TIMEOUT_SECONDS:-}
+      SOP_TURN_BUDGET_SECONDS: ${SOP_TURN_BUDGET_SECONDS:-}
+      SOP_MODEL_BREAKER_FAILURES: ${SOP_MODEL_BREAKER_FAILURES:-}
+      SOP_MODEL_BREAKER_SECONDS: ${SOP_MODEL_BREAKER_SECONDS:-}
+      # Delivery of the summary e-mail and the handoff: demo transports unless configured.
+      SOP_DISPATCH: ${SOP_DISPATCH:-}
+      SOP_EMAIL_TRANSPORT: ${SOP_EMAIL_TRANSPORT:-}
+      SOP_SMTP_URL: ${SOP_SMTP_URL:-}
+      SOP_EMAIL_FROM: ${SOP_EMAIL_FROM:-}
+      SOP_EMAIL_REDIRECT_TO: ${SOP_EMAIL_REDIRECT_TO:-}
+      SOP_HANDOFF_TRANSPORT: ${SOP_HANDOFF_TRANSPORT:-}
+      SOP_HANDOFF_WEBHOOK_URL: ${SOP_HANDOFF_WEBHOOK_URL:-}
+      SOP_HANDOFF_WEBHOOK_TOKEN: ${SOP_HANDOFF_WEBHOOK_TOKEN:-}
       SOP_RATE_LIMIT_PER_MINUTE: ${SOP_RATE_LIMIT_PER_MINUTE:-}
       SOP_TRUST_PROXY: ${SOP_TRUST_PROXY:-}
       SOP_MOCK_LATENCY_MS: ${SOP_MOCK_LATENCY_MS:-}
     volumes:
       # Where the SQLite session store lives when SOP_SESSION_STORE points into /data.
       - sop-data:/data
+    # Longer than SOP_SHUTDOWN_GRACE_SECONDS (30): a stopping instance finishes the turns it has.
+    stop_grace_period: 40s
 
 volumes:
   sop-data:

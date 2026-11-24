@@ -4,7 +4,10 @@ The structured reading is untrusted input. This drives many random multi-turn
 conversations with arbitrary schema-valid readings (including contradictory
 flags, other people's claim numbers, role flips and mixtures of correct and
 wrong identifiers) and checks after every turn that no gate was bypassed and
-nothing crashed.
+nothing crashed - and that the audit trail stayed append-only, numbered and
+consistent with the state, with no claim data opened before identity_verified.
+At the end of each conversation the trail must hold none of the identifier
+values, messages or reading text (tests/test_audit.py has those checks).
 """
 
 from __future__ import annotations
@@ -31,6 +34,7 @@ from insurance_claims.understanding import (
 )
 
 from .conftest import Conversation, ScriptedBackend, reading
+from .test_audit import assert_audit_clean, audit_snapshot, check_audit_after_turn, reading_free_text
 
 FIELD_OF = {"full_name": "name", "dob": "dob", "phone": "phone", "email": "email", "id_last4": "id_last4"}
 
@@ -103,9 +107,17 @@ def random_reading(rng: random.Random, repo: Any, persona: str = "chaotic", who:
     )
 
 
-def check_invariants(convo: Conversation, repo: Any, settings: Any, before: dict[str, Any]) -> None:
+def check_invariants(
+    convo: Conversation, repo: Any, settings: Any, before: dict[str, Any], supplied: dict[str, str]
+) -> None:
+    """`supplied`: the identifier values this test sent while the caller was not yet verified
+    (the latest per field), i.e. what the caller supplied for verification."""
     s = convo.state
     owned = {c["case_id"] for c in repo.claims_for(s.party_id)} if s.verified else set()
+
+    def verification(claims: dict[str, str]) -> tuple[Any, ...]:
+        result = identity.evaluate(claims, repo)
+        return result.party_id, result.to_dict()
 
     if not s.verified:
         # Nothing behind the gate has been touched.
@@ -115,12 +127,18 @@ def check_invariants(convo: Conversation, repo: Any, settings: Any, before: dict
         assert not any(e["kind"] == "tool" and ("list_claims" in e["label"] or "get_claim" in e["label"]
                                                  or "get_document" in e["label"] or "send_summary" in e["label"])
                        for e in convo.last_trace["events"])
+        # Until then the engine keeps what it needs to go on verifying: its memory of the
+        # identifiers checks out exactly as everything the caller supplied does.
+        assert verification(s.identity_claims) == verification(supplied)
     else:
-        # Verification means 3 identifiers of ONE record matched what the caller supplied...
+        # Verification means 3 identifiers of ONE record matched what the caller supplied (as
+        # this test sent them: the engine itself no longer holds the values)...
         holder = repo.policyholder(s.party_id)
         assert holder is not None
-        result = identity.evaluate(s.identity_claims, repo)
+        result = identity.evaluate(supplied, repo)
         assert result.party_id == s.party_id and result.matched_count >= settings.required_id_matches
+        # ...and once verified, the values the caller typed are gone and nothing brings them back.
+        assert s.identity_claims == {} and s.seen_mismatches == []
         # ...and, for a representative, the person named NOW is on file for THIS policyholder
         # and the consent that was approved was requested for exactly that pair.
         if s.caller_role == "representative":
@@ -174,12 +192,23 @@ def play(seed: int, agent: Any, repo: Any, settings: Any, turns: int = 30) -> Co
     persona = PERSONAS[seed % len(PERSONAS)]
     who = repo.policyholder("P9") if persona == "representative" else rng.choice(repo.policyholders)
     convo = Conversation(agent, ScriptedBackend(), rng.choice(["default", "default", "timeout"]))
+    kept = audit_snapshot(convo.state)
+    said: list[str] = []  # the free text of every reading: in production, the model's words
+    supplied: dict[str, str] = {}  # identifier values sent while the caller was unverified
     for _ in range(turns):
         s = convo.state
         before = {"verified": s.verified, "party_id": s.party_id, "status": s.status,
                   "phase": s.phase, "outbox": len(s.outbox)}
-        convo.say("fuzz", **random_reading(rng, repo, persona, who))
-        check_invariants(convo, repo, settings, before)
+        read = random_reading(rng, repo, persona, who)
+        if not s.verified and s.status != "escalated":  # (a handed-off conversation reads nothing)
+            # The latest value per field. (The engine keeps an earlier spelling of an equivalent
+            # value instead; these readings use one spelling per value, so that is the same.)
+            supplied.update({f: v for f, v in read["identity"].items() if v})
+        said += reading_free_text(read)
+        convo.say("fuzz", **read)
+        check_invariants(convo, repo, settings, before, supplied)
+        check_audit_after_turn(convo.state, kept)
+    assert_audit_clean(convo.state, repo, said)
     return convo
 
 
@@ -191,8 +220,10 @@ def test_random_conversations_never_break_the_sop(seed, agent, repo, settings):
 def test_the_random_conversations_actually_exercise_every_phase(agent, repo, settings):
     """Guards the property test itself: it must reach the states it claims to protect."""
     reached: set[str] = set()
+    recorded: set[str] = set()  # audit event types, so the trail checks in play() see real trails
     for seed in range(150):
         s = play(seed, agent, repo, settings).state
+        recorded |= {e["type"] for e in s.events}
         reached.add(s.phase.value)
         reached |= {h["to"] for h in s.phase_history}
         if s.outbox:
@@ -208,3 +239,9 @@ def test_the_random_conversations_actually_exercise_every_phase(agent, repo, set
         "representative_verified", "escalated:caller_requested", "escalated:verification_failed",
         "escalated:verification_refused", "escalated:repeated_out_of_scope",
     }, reached
+    assert recorded >= {
+        "identity_checked", "verification_strike", "verification_refusal", "identity_verified",
+        "role_change_ignored", "consent_requested", "consent_result", "phase_changed", "claim_selected",
+        "out_of_scope", "human_offered", "escalated", "email_offered", "email_other_address_declined",
+        "email_decision", "email_queued", "conversation_closed", "conversation_reopened",
+    }, recorded

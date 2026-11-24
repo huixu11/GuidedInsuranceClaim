@@ -76,13 +76,17 @@ class Agent:
             {"turn": 0, "from": None, "to": Phase.VERIFY_ID.value, "reason": "session_start"}
         )
         state.messages.append({"role": "assistant", "text": replies.GREETING, "turn": 0})
+        state.audit("conversation_started", consent_scenario=consent_scenario, phase=Phase.VERIFY_ID.value)
         return state
 
     def handle_turn(
-        self, state: SessionState, user_text: str, backend: Backend
+        self, state: SessionState, user_text: str, backend: Backend, message_id: str | None = None
     ) -> tuple[str, dict[str, Any]]:
         """Process one caller message. Mutates `state`; callers pass a working copy and
         commit it only if this returns (an LLMError means: discard the copy, nothing happened).
+
+        `message_id`, when the client sent one, is stored with the caller's message (as "id"),
+        so that a retry of the same message can be recognised and answered from the transcript.
 
         A conversation holds at most `max_turns_per_conversation` messages: the last one is
         answered by a handoff to a human without reading it, and any message after that raises
@@ -98,16 +102,19 @@ class Agent:
         state.turn += 1
         trace = Trace(turn=state.turn, phase_before=state.phase.value)
         tools = Toolbox(self.repo, state, trace, cfg)
+        said: dict[str, Any] = {"role": "user", "text": user_text, "turn": state.turn}
+        if message_id is not None:
+            said["id"] = message_id
 
         if state.status == STATUS_ESCALATED:
-            state.messages.append({"role": "user", "text": user_text, "turn": state.turn})
+            state.messages.append(said)
             trace.add("gate", "conversation already handed to a human — no further processing", None)
             return self._finish(state, trace, replies.ESCALATED_NOTICE, started)
 
         if state.turn >= limit:
             # The last message one conversation may hold: close it with a handoff, the same
             # way as the other handoffs, instead of letting it (and its cost) grow without end.
-            state.messages.append({"role": "user", "text": user_text, "turn": state.turn})
+            state.messages.append(said)
             directive = policy.close_at_turn_limit(state, tools, backend, trace, cfg, self.repo)
             return self._finish(state, trace, self._reply(state, directive, tools, backend, trace), started)
 
@@ -136,8 +143,9 @@ class Agent:
                 degraded=True,
             )
             trace.add("error", "the model declined this message — treated as out of scope", None)
+            state.audit("model_refused", call="understand", outcome="treated_as_out_of_scope")
         trace.add("understand", u.summary or "caller message read", u.trace_view())
-        state.messages.append({"role": "user", "text": user_text, "turn": state.turn})
+        state.messages.append(said)
 
         # 2. Decide (deterministic SOP engine).
         directive = policy.step(state, u, tools, backend, trace, cfg, self.repo)
@@ -192,6 +200,8 @@ class Agent:
             except (LLMRefusal, LLMError) as exc:
                 # The move is already decided and its tools have run; only the wording failed.
                 trace.add("error", f"reply unavailable ({exc}) — using the template wording", None)
+                if isinstance(exc, LLMRefusal) and exc.kind == "refusal":
+                    state.audit("model_refused", call="respond", outcome="template_reply")
                 return None
             meta = dict(result.meta)
             if result.tool_calls:
@@ -209,8 +219,10 @@ class Agent:
         if hard:
             state.guard_blocks += 1
             trace.add("guard", "reply blocked — template wording sent instead", hard)
+            state.audit("guard_blocked", target="reply", rules=guard.rule_names(hard), outcome="template")
             return template
         if soft:
+            first_draft = soft
             trace.add("guard", "reply not grounded — regenerating once", soft)
             retry = generate(
                 control
@@ -227,7 +239,10 @@ class Agent:
             if retry is None or hard or soft:
                 state.guard_blocks += 1
                 trace.add("guard", "regenerated reply still rejected — template wording sent", hard + soft)
+                state.audit("guard_blocked", target="reply", rules=guard.rule_names(first_draft + hard + soft),
+                            outcome="template")
                 return template
+            state.audit("guard_blocked", target="reply", rules=guard.rule_names(first_draft), outcome="regenerated")
             text = retry
         trace.add("guard", "reply passed leak, verification-claim and grounding checks", None)
         return text

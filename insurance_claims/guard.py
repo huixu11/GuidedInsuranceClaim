@@ -239,3 +239,49 @@ def summary_violations(
         violations += leak_violations(text, state, repo, allow_echo=False)
         violations += grounding_violations(text, state, claims, owned_case_ids)
     return violations
+
+
+# The rules above by fixed name, for the audit trail: a violation text can hold the offending
+# value (an amount, a claim number, the model's own words), so only these names are recorded.
+# Leak rules name the kind of data too ("other_person_identifier.dob").
+_LEAK_RULE_PREFIXES = (
+    ("own stored identifier: ", "own_identifier"),
+    ("another person's identifier: ", "other_person_identifier"),
+    ("claim data before verification: ", "claim_data_before_verification"),
+    ("another person's claim data: ", "other_person_claim_data"),
+)
+_OTHER_RULE_PREFIXES = (
+    ("states that verification is complete: ", "premature_verification"),
+    ("amount not in the claim data: ", "ungrounded_amount"),
+    ("claim number not on this account: ", "ungrounded_claim_number"),
+)
+_LEAK_ITEMS = {
+    "email": "email",
+    "phone": "phone",
+    "date of birth": "dob",
+    "id last 4": "id_last4",
+    "policy number": "policy_number",
+    "case id": "case_id",
+    "denial reason": "denial_reason",
+}
+UNNAMED_RULE = "unnamed_rule"  # a violation text this table does not know (a wording change)
+RULE_NAMES: frozenset[str] = frozenset(
+    {rule for _, rule in _LEAK_RULE_PREFIXES + _OTHER_RULE_PREFIXES}
+    | {f"{rule}.{item}" for _, rule in _LEAK_RULE_PREFIXES for item in _LEAK_ITEMS.values()}
+    | {UNNAMED_RULE}
+)
+
+
+def rule_names(violations: list[str]) -> list[str]:
+    """The fixed names of the rules behind `violations` (sorted, each once)."""
+    names = set()
+    for text in violations:
+        for prefix, rule in _LEAK_RULE_PREFIXES:
+            if text.startswith(prefix):
+                item = _LEAK_ITEMS.get(text[len(prefix):])
+                names.add(f"{rule}.{item}" if item else rule)
+                break
+        else:
+            names.add(next((rule for prefix, rule in _OTHER_RULE_PREFIXES if text.startswith(prefix)),
+                           UNNAMED_RULE))
+    return sorted(names)

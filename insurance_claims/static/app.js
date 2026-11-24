@@ -80,6 +80,11 @@
     server_busy: 'Server busy',
     payload_too_large: 'Message too large',
     conversation_closed: 'Conversation closed',
+    model_unavailable: 'Model unavailable',
+    model_overloaded: 'Model overloaded',
+    turn_timeout: 'Took too long',
+    message_id_reused: 'Message id reused',
+    not_ready: 'Server not ready',
     internal_error: 'Server error',
     network_error: 'Network error',
     timeout: 'No response',
@@ -92,14 +97,23 @@
   // After these errors the server state cannot have moved, so skip the resync GET.
   const NO_RESYNC = new Set([
     'aborted', 'session_not_found', 'network_error', 'missing_api_key', 'invalid_api_key', 'bad_request', 'render_error',
-    'server_busy', 'payload_too_large', 'rate_limited',
+    'server_busy', 'payload_too_large', 'rate_limited', 'model_unavailable', 'model_overloaded', 'turn_timeout',
+    'message_id_reused', 'not_ready',
   ]);
-  // "Busy, come back shortly" answers (409 conversation_busy, 503 server_busy, any 429): the
-  // message is sent again by itself a few times, honouring Retry-After, while the typing
-  // indicator stays up; only then does the error row with its Retry button appear.
-  const AUTO_RETRY_CODES = new Set(['conversation_busy', 'server_busy']);
+  // "Busy, come back shortly" answers (409 conversation_busy, 503 server_busy or a model that is
+  // unavailable or overloaded, any 429): the message is sent again by itself a few times, with
+  // the same message id and honouring Retry-After, while the typing indicator stays up; only
+  // then does the error row with its Retry button appear.
+  const AUTO_RETRY_CODES = new Set(['conversation_busy', 'server_busy', 'model_unavailable', 'model_overloaded']);
   const AUTO_RETRIES = 3;
   const AUTO_RETRY_MAX_WAIT_S = 10; // a longer Retry-After goes straight to the error row
+
+  // Delivery of what a turn queued (the summary email, the handoff to a human), as the server
+  // reports it on each entry: { status: queued | sent | failed, attempts, sent_at }.
+  const DELIVERY_TEXT = { queued: 'Queued', sent: 'Sent', failed: 'Not delivered' };
+  const DELIVERY_TONE = { queued: 'tone-warn', sent: 'tone-ok', failed: 'tone-bad' };
+  // While something is queued, the conversation is read again after these delays, then no more.
+  const DELIVERY_POLL_MS = [1500, 3000, 6000, 12000];
 
   const PH_FIELDS = [
     ['name', 'Full name'],
@@ -181,7 +195,7 @@
     starting: false,
     sendController: null,
     sessionController: null,
-    failed: null, // { text, row, retryBtn, userRow } for the latest failed message
+    failed: null, // { text, row, retryBtn, userRow, messageId } for the latest failed message
     sessionLost: false,
     keyError: '', // code of the last API-key error, until a key is saved or a turn succeeds
     activeTab: 'chat', // narrow screens: chat | inspector
@@ -192,6 +206,8 @@
     userTurns: [], // { turn, text } of every caller message in this conversation
     suggestKey: null, // what the suggestion row shows, to skip needless re-renders
     emailSeq: 0,
+    deliveryTimer: 0, // the next read of the conversation while a delivery is queued
+    deliveryPolls: 0,
   };
 
   const dom = {};
@@ -390,6 +406,22 @@
   function canAutoRetry(err) {
     return (AUTO_RETRY_CODES.has(err.code) || err.status === 429)
       && (err.retryAfter || 1) <= AUTO_RETRY_MAX_WAIT_S;
+  }
+
+  // One id per message, sent again with every retry of it (automatic or the Retry button): the
+  // server answers a retry of a message it has already answered from the transcript, so a reply
+  // lost on the way back is never produced twice. 32 hex characters.
+  function newMessageId() {
+    const c = window.crypto;
+    try {
+      if (c && typeof c.randomUUID === 'function') return c.randomUUID().replace(/-/g, '');
+      if (c && typeof c.getRandomValues === 'function') {
+        return Array.from(c.getRandomValues(new Uint8Array(16)), (b) => b.toString(16).padStart(2, '0')).join('');
+      }
+    } catch (_) {
+      // fall through: no usable crypto (very old browsers)
+    }
+    return `m${Date.now().toString(36)}${Math.random().toString(36).slice(2)}${Math.random().toString(36).slice(2)}`.slice(0, 40);
   }
 
   // Resolves after `ms`, or at once when the request is cancelled.
@@ -1556,10 +1588,35 @@
     return arr(obj(stateOf('email')).outbox).filter((m) => isObj(m) && m.sent_turn === turn);
   }
 
+  // The delivery of an outbox entry or of the escalation, if the server reported a known one.
+  function deliveryOf(entry) {
+    const d = obj(obj(entry).delivery);
+    return Object.prototype.hasOwnProperty.call(DELIVERY_TEXT, d.status) ? d : null;
+  }
+
+  // "Queued", "Sent 14:05", "Not delivered after 8 attempts", coloured by its tone.
+  function deliveryStatus(d) {
+    if (!d) return null;
+    let text = DELIVERY_TEXT[d.status];
+    if (d.status === 'sent' && isNum(d.sent_at)) {
+      text += ` ${new Date(d.sent_at * 1000).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })}`;
+    } else if (d.status === 'failed' && isNum(d.attempts) && d.attempts > 0) {
+      text += ` after ${d.attempts} attempt${d.attempts === 1 ? '' : 's'}`;
+    }
+    return el('span', { class: `delivery-status ${DELIVERY_TONE[d.status]}` }, text);
+  }
+
+  // "Email summary to m•••@email.com · Sent 14:05" above the summary email in the chat.
+  function emailCaptionParts(m) {
+    const status = deliveryStatus(deliveryOf(m));
+    return [`Email summary to ${str(m.to) || 'the address on file'}`, status ? ' · ' : null, status];
+  }
+
   // The summary email, as the caller would get it: collapsed to a few lines until expanded.
   function chatEmailCard(m) {
     app.emailSeq += 1;
     const bodyId = `chat-email-body-${app.emailSeq}`;
+    const index = arr(obj(stateOf('email')).outbox).indexOf(m);
     const toggleText = el('span', null, 'Show full email');
     const toggle = el('button', {
       type: 'button',
@@ -1567,11 +1624,11 @@
       'aria-expanded': 'false',
       'aria-controls': bodyId,
     }, toggleText, icon('chevron', 'chev'));
-    const node = el('div', { class: 'chat-email', role: 'group', 'aria-label': 'Email summary sent' },
+    const node = el('div', { class: 'chat-email', role: 'group', 'aria-label': 'Email summary' },
       el('div', { class: 'email-head' },
         el('span', { class: 'email-icon' }, icon('mail')),
         el('div', { class: 'email-head-main' },
-          el('p', { class: 'email-caption' }, `Email summary sent to ${str(m.to) || 'the address on file'}`),
+          el('p', { class: 'email-caption', 'data-email-index': index >= 0 ? String(index) : null }, emailCaptionParts(m)),
           el('p', { class: 'email-subject' }, str(m.subject) || '(no subject)'))),
       el('div', { class: 'email-body', id: bodyId }, str(m.body) || '(empty body)'),
       toggle);
@@ -1582,6 +1639,62 @@
       toggleText.textContent = open ? 'Show less' : 'Show full email';
     });
     return node;
+  }
+
+  // The summary emails already in the chat show the delivery status the state has now.
+  function refreshChatEmails() {
+    const outbox = arr(obj(stateOf('email')).outbox);
+    dom.chatItems.querySelectorAll('.email-caption[data-email-index]').forEach((p) => {
+      const m = outbox[Number(p.getAttribute('data-email-index'))];
+      if (!isObj(m)) return;
+      p.replaceChildren();
+      append(p, emailCaptionParts(m));
+    });
+  }
+
+  // A turn's reply reports the delivery only of what that turn queued: what the page already
+  // knew about the earlier entries is kept until the conversation is read again.
+  function keepDelivery(prev, next) {
+    if (!isObj(prev) || !isObj(next)) return next;
+    const known = arr(obj(prev.email).outbox);
+    const email = obj(next.email);
+    if (arr(email.outbox).some((m, i) => isObj(m) && !deliveryOf(m) && deliveryOf(known[i]))) {
+      next.email = Object.assign({}, email, {
+        outbox: arr(email.outbox).map((m, i) => (isObj(m) && !deliveryOf(m) && deliveryOf(known[i])
+          ? Object.assign({}, m, { delivery: known[i].delivery })
+          : m)),
+      });
+    }
+    if (isObj(next.escalation) && !deliveryOf(next.escalation) && deliveryOf(prev.escalation)) {
+      next.escalation = Object.assign({}, next.escalation, { delivery: prev.escalation.delivery });
+    }
+    return next;
+  }
+
+  function deliveryQueued() {
+    return arr(obj(stateOf('email')).outbox).some((m) => obj(deliveryOf(m)).status === 'queued')
+      || obj(deliveryOf(stateOf('escalation'))).status === 'queued';
+  }
+
+  // While an email or a handoff is queued, read the conversation again a few times (backing
+  // off) so that the page shows when it was sent, or that it could not be delivered.
+  function scheduleDeliveryCheck(restart) {
+    window.clearTimeout(app.deliveryTimer);
+    app.deliveryTimer = 0;
+    if (restart) app.deliveryPolls = 0;
+    if (!app.sessionId || !deliveryQueued() || app.deliveryPolls >= DELIVERY_POLL_MS.length) return;
+    const gen = app.gen;
+    app.deliveryTimer = window.setTimeout(async () => {
+      app.deliveryTimer = 0;
+      if (gen !== app.gen) return;
+      if (app.pending) { // a message is on its way; its reply brings the state
+        scheduleDeliveryCheck(false);
+        return;
+      }
+      app.deliveryPolls += 1;
+      await resyncState();
+      if (gen === app.gen) scheduleDeliveryCheck(false);
+    }, DELIVERY_POLL_MS[app.deliveryPolls]);
   }
 
   // An email that fits in the collapsed height needs no toggle. Measured once it is in the
@@ -1793,13 +1906,16 @@
     const gen = app.gen;
     const sessionId = app.sessionId;
     let userRow = null;
+    let messageId = null;
     if (isRetry) {
       userRow = app.failed ? app.failed.userRow : null;
+      messageId = app.failed ? app.failed.messageId : null; // the same message: the same id
       removeFailedRow();
     } else {
       retireFailedRow();
       userRow = appendUserMessage(text, null);
     }
+    if (!messageId) messageId = newMessageId();
     const controller = new AbortController();
     app.sendController = controller;
     app.pending = true;
@@ -1810,7 +1926,8 @@
     let error = null;
     for (let attempt = 0; ; attempt += 1) {
       try {
-        data = await api('POST', `/api/sessions/${encodeURIComponent(sessionId)}/messages`, { text }, {
+        const body = { text, message_id: messageId };
+        data = await api('POST', `/api/sessions/${encodeURIComponent(sessionId)}/messages`, body, {
           controller,
           timeoutMs: MESSAGE_TIMEOUT_MS,
         });
@@ -1832,7 +1949,7 @@
     updateComposerState();
 
     if (error) {
-      handleSendError(error, text, userRow);
+      handleSendError(error, text, userRow, messageId);
     } else {
       try {
         handleReply(data, text, userRow);
@@ -1845,10 +1962,12 @@
     restoreComposerFocus(false);
   }
 
+  // `data.replayed`: the server had answered this message already (an earlier attempt whose
+  // reply was lost on the way back) and sent that answer again; it is shown like any reply.
   function handleReply(data, text, userRow) {
     const trace = isObj(data.trace) ? normalizeTrace(data.trace) : null;
     const sentBefore = arr(obj(stateOf('email')).outbox).length;
-    if (isObj(data.state)) app.state = data.state;
+    if (isObj(data.state)) app.state = keepDelivery(app.state, data.state);
     if (trace) upsertTrace(trace);
     if (app.keyError) {
       app.keyError = ''; // the key worked
@@ -1863,18 +1982,24 @@
     let turn = trace && isNum(trace.turn) ? trace.turn : null;
     if (turn === null && isNum(stateOf('turn'))) turn = stateOf('turn');
     if (userRow && isNum(turn)) userRow.setAttribute('data-turn', String(turn));
-    if (text) app.userTurns.push({ turn: isNum(turn) ? turn : 0, text });
+    // A replayed answer may be for a message a resync has already listed.
+    const listed = data.replayed === true && app.userTurns.some((m) => m.turn === turn);
+    if (text && !listed) app.userTurns.push({ turn: isNum(turn) ? turn : 0, text });
     let emails = emailsForTurn(turn);
-    if (!emails.length) emails = arr(obj(stateOf('email')).outbox).slice(sentBefore); // entries without a turn
+    if (!emails.length && data.replayed !== true) {
+      emails = arr(obj(stateOf('email')).outbox).slice(sentBefore); // entries without a turn
+    }
     const row = appendAssistantMessage(str(data.reply), turn, emails);
 
     renderInspector();
+    refreshChatEmails();
     updateStatusUi();
     scrollChatTo(first || row);
     if (isMobile() && app.activeTab !== 'chat') markUnread('chat');
+    scheduleDeliveryCheck(true);
   }
 
-  function handleSendError(err, text, userRow) {
+  function handleSendError(err, text, userRow, messageId) {
     if (err.code === 'aborted') return;
     if (err.code === 'session_not_found') {
       app.sessionLost = true;
@@ -1883,13 +2008,14 @@
       scrollChatToBottom(); // the note was added after the error row
       return;
     }
-    if (err.code === 'conversation_closed') {
-      // The message limit was reached (perhaps in another tab): nothing to retry; show the handoff.
+    if (err.code === 'conversation_closed' || err.code === 'message_id_reused') {
+      // The message limit was reached (perhaps in another tab), or the id was taken: sending
+      // the same message again cannot help; show what the server has.
       showFailedRow(text, err, false, userRow);
       resyncState();
       return;
     }
-    showFailedRow(text, err, true, userRow);
+    showFailedRow(text, err, true, userRow, messageId);
     if (KEY_ERRORS.has(err.code)) {
       noteKeyError(err);
       openSettings({ error: err.message });
@@ -1909,7 +2035,8 @@
     updateSettingsButton();
   }
 
-  function showFailedRow(text, err, canRetry, userRow) {
+  // `messageId`: the id the message was sent with; the Retry button sends it again with it.
+  function showFailedRow(text, err, canRetry, userRow, messageId) {
     removeFailedRow();
     const title = ERROR_TITLES[err.code] || (err.status ? `Server error ${err.status}` : 'Something went wrong');
     const retryBtn = canRetry
@@ -1929,7 +2056,7 @@
         err.code ? el('p', { class: 'chat-error-code' }, `Error code: ${err.code}`) : null),
       retryBtn);
     dom.chatItems.appendChild(row);
-    app.failed = canRetry ? { text, row, retryBtn, userRow: userRow || null } : null;
+    app.failed = canRetry ? { text, row, retryBtn, userRow: userRow || null, messageId: messageId || null } : null;
     scrollChatToBottom();
   }
 
@@ -1961,13 +2088,14 @@
       return;
     }
     if (gen !== app.gen || app.pending) return;
-    if (isObj(data.state)) app.state = data.state;
+    if (isObj(data.state)) app.state = data.state; // with the delivery of everything queued so far
     if (Array.isArray(data.traces)) {
       app.traces = [];
       data.traces.filter(isObj).forEach((t) => upsertTrace(normalizeTrace(t)));
     }
     if (Array.isArray(data.messages)) app.userTurns = userTurnsOf(data.messages);
     renderInspector();
+    refreshChatEmails();
     updateStatusUi();
   }
 
@@ -1998,6 +2126,9 @@
     app.pending = false;
     app.userTurns = [];
     app.suggestKey = null;
+    window.clearTimeout(app.deliveryTimer);
+    app.deliveryTimer = 0;
+    app.deliveryPolls = 0;
     showTyping(false);
     dom.chatItems.replaceChildren();
     dom.chatStatus.replaceChildren();
@@ -2141,6 +2272,7 @@
     renderInspector();
     updateStatusUi();
     scrollChatToBottom();
+    scheduleDeliveryCheck(true);
     const skipFocus = app.firstSession && mqCoarse.matches; // no surprise keyboard on phones
     app.firstSession = false;
     if (!skipFocus) restoreComposerFocus(true);
@@ -2421,11 +2553,15 @@
       let reason = muted('Not recorded');
       if (esc.reason) reason = humanizeCode(esc.reason);
       else if (e && !isObj(e)) reason = str(e);
+      const handoff = deliveryOf(esc);
       return section('phase', 'Current phase', statusText('Handed to a human', 'warn'), [
         name,
         el('p', { class: 'sec-text' },
           `The conversation stopped here and was transferred to a human representative${isNum(esc.turn) ? ` at turn ${esc.turn}` : ''}.`),
-        rows([ctx.track(row('Reason', reason), 'p.reason', esc.reason === undefined ? null : esc.reason)]),
+        rows([
+          ctx.track(row('Reason', reason), 'p.reason', esc.reason === undefined ? null : esc.reason),
+          handoff ? ctx.track(row('Handoff', deliveryStatus(handoff)), 'p.handoff', handoff.status) : null,
+        ]),
         summary
           ? toggleBlock('handoff', ['Show handoff summary', 'Hide handoff summary'], el('p', { class: 'sec-pre' }, summary))
           : null,
@@ -2654,8 +2790,9 @@
     if (outbox.length) {
       return section('email', 'Summary email', null, outbox.map((m, i) => el('div', { class: 'sent-email' },
         ctx.track(el('p', { class: 'sec-text' },
-          `Sent to ${str(m.to) || 'the address on file'}`,
-          isNum(m.sent_turn) ? el('span', { class: 'row-meta' }, `turn ${m.sent_turn}`) : null), `em.sent.${i}`, m),
+          `To ${str(m.to) || 'the address on file'}`,
+          isNum(m.sent_turn) ? el('span', { class: 'row-meta' }, `turn ${m.sent_turn}`) : null,
+          deliveryOf(m) ? el('span', { class: 'row-meta' }, deliveryStatus(deliveryOf(m))) : null), `em.sent.${i}`, m),
         toggleBlock(`email-${i}`, ['Show email', 'Hide email'], [
           el('p', { class: 'email-subject' }, str(m.subject) || '(no subject)'),
           el('p', { class: 'sec-pre' }, str(m.body) || '(empty body)'),

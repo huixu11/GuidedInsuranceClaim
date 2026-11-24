@@ -61,11 +61,11 @@ class Gate:
         self.order: list[str] = []  # conversations, in the order their turns reached the engine
         real = server.agent.handle_turn
 
-        def held_turn(state, text, backend):
+        def held_turn(state, text, backend, **kwargs):
             self.order.append(state.session_id)
             self.entered.release()
             assert self.release.wait(20), "the test never released the turn"
-            return real(state, text, backend)
+            return real(state, text, backend, **kwargs)
 
         monkeypatch.setattr(server.agent, "handle_turn", held_turn)
 
@@ -345,7 +345,9 @@ def test_stats_report_load_without_conversation_content(serve, caplog):
     client.post(f"/api/sessions/{sid}/messages", json={"text": "What is RL?"})
 
     stats = client.get("/api/stats").json()
-    assert set(stats) == {"uptime_seconds", "process", "store", "turn_slots", "counters", "turn_latency_ms", "limits"}
+    assert set(stats) == {"uptime_seconds", "process", "store", "model", "dispatcher", "turn_slots", "counters",
+                          "turn_latency_ms", "limits"}
+    assert stats["dispatcher"]["enabled"] is False  # the tests run without one (conftest: SOP_DISPATCH=off)
     assert stats["store"]["kind"] == "memory" and stats["store"]["sessions_held"] == 1
     assert stats["store"]["shared_between_processes"] is False
     assert stats["turn_slots"] == {"in_use": 0, "max": server.settings.max_concurrent_turns, "waiting": 0}

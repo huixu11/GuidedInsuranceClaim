@@ -7,6 +7,20 @@ conversation waits briefly, then 409 conversation_busy). Everything else (health
 static files, reads) never needs a turn slot. Bodies over 16 KB are refused (413) before they
 are parsed, and an optional per-client rate limit answers 429. Every refusal uses the error
 envelope and leaves the conversation exactly as it was.
+
+Recovering from failures:
+
+- A message may carry a `message_id` chosen by the client. A retry with the same id never runs
+  the turn twice: once the first attempt has committed, the retry is answered from the transcript
+  (`"replayed": true`), on whichever instance it reaches.
+- What a turn decided to send (the summary e-mail, the handoff to a human) is queued in the
+  store with the turn's commit and delivered by a dispatcher (dispatch.py), one per process.
+  Reading a conversation shows each one's delivery ({status: queued | sent | failed, attempts,
+  sent_at}); a turn's reply shows it for what that turn queued. GET /api/sessions/{id}/audit
+  lists the audit events and the queued effects, without their content.
+- /healthz is liveness; /readyz says whether this instance can reach its store. On SIGTERM the
+  instance stops accepting, lets turns in flight finish (SOP_SHUTDOWN_GRACE_SECONDS), then stops
+  its dispatcher and closes the store; a turn still running after that is not committed.
 """
 
 from __future__ import annotations
@@ -34,12 +48,14 @@ from pydantic import BaseModel, Field
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from . import sop
+from . import llm, sop
 from .agent import Agent, ConversationClosed
 from .config import AGENT_NAME, APP_NAME, STATIC_DIR, Settings, load_settings, server_has_credentials
 from .data import Repository
+from .dispatch import QUEUED, Dispatcher, delivery_of, turn_effects, with_delivery
 from .llm import AnthropicBackend, LLMError
 from .mock_llm import MockBackend
+from .state import SessionState
 from .store import (
     ConversationBusy,
     SessionNotFound,
@@ -59,6 +75,8 @@ agent = Agent(repo, settings)
 MAX_BODY_BYTES = 16 * 1024  # request bodies; a 4,000-character message is at most ~16,000 bytes of UTF-8
 MAX_MESSAGE_CHARS = 4000
 SESSION_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")  # ids are uuid4 hex; anything else cannot exist
+MESSAGE_ID = re.compile(r"[A-Za-z0-9_-]{8,64}")  # chosen by the client, one per message (not per attempt)
+READY_TIMEOUT_SECONDS = 2.0  # /readyz answers 503 when the store does not answer within this
 
 # Suggested caller messages for the test UI, tagged with where in the SOP they make sense.
 #   phases      The phases the suggestion fits.
@@ -332,6 +350,7 @@ COUNTERS = (
     "too_large_413",
     "model_errors",
     "closed_at_message_limit_409",
+    "replayed_messages",  # a retried message answered from the transcript instead of run again
 )
 
 
@@ -378,8 +397,9 @@ class Stats:
 
 
 class Runtime:
-    """What serving needs besides the engine: the store, the turn slots, the rate limiter and
-    the counters. Built once per process from the settings; tests swap in their own."""
+    """What serving needs besides the engine: the store, the turn slots, the rate limiter, the
+    counters and the dispatcher that delivers queued effects (started by the app's lifespan).
+    Built once per process from the settings; tests swap in their own."""
 
     def __init__(self, cfg: Settings, store: SessionStore | None = None) -> None:
         self.settings = cfg
@@ -387,9 +407,14 @@ class Runtime:
         self.slots = TurnSlots(cfg.max_concurrent_turns)
         self.limiter = RateLimiter(cfg.rate_limit_per_minute) if cfg.rate_limit_per_minute > 0 else None
         self.stats = Stats()
+        # Built now, so that a misconfigured transport stops the start; started by the lifespan.
+        self.dispatcher = Dispatcher(self.store, repo, cfg) if cfg.dispatch else None
+        # Set once the shutdown is past its grace period: a turn still running is not committed.
+        self.closing = False
 
     def describe(self) -> str:
         budget = getattr(self.store, "max_bytes", 0)
+        d = self.dispatcher
         return (
             f"{self.store.kind} session store"
             + (" (shared)" if self.store.shared else " (this process only)")
@@ -398,6 +423,8 @@ class Runtime:
             + (f" or {budget // (1024 * 1024)} MB of state" if budget else "")
             + ", rate limit "
             + (f"{self.settings.rate_limit_per_minute}/min per client" if self.limiter else "off")
+            + ", delivery "
+            + (f"by this process (e-mail: {d.email.name}, handoff: {d.handoff.name})" if d else "off (SOP_DISPATCH=off)")
         )
 
 
@@ -405,18 +432,24 @@ runtime = Runtime(settings)
 
 # Turns run on worker threads of their own, sized to the turn slots, so they can never use up
 # the default pool that serves reads, session creation and static files (one per event loop).
+# Readiness checks get two threads of their own, so a store that hangs cannot pile them up.
 _turn_threads: RunVar[anyio.CapacityLimiter] = RunVar("sop_turn_threads")
+_ping_threads: RunVar[anyio.CapacityLimiter] = RunVar("sop_ping_threads")
 
 
-def _turn_thread_limiter(size: int) -> anyio.CapacityLimiter:
+def _thread_limiter(var: RunVar[anyio.CapacityLimiter], size: int) -> anyio.CapacityLimiter:
     try:
-        limiter = _turn_threads.get()
+        limiter = var.get()
     except LookupError:
         limiter = anyio.CapacityLimiter(size)
-        _turn_threads.set(limiter)
+        var.set(limiter)
     if limiter.total_tokens != size:
         limiter.total_tokens = size
     return limiter
+
+
+def _turn_thread_limiter(size: int) -> anyio.CapacityLimiter:
+    return _thread_limiter(_turn_threads, size)
 
 
 _backends: dict[str, Any] = {}
@@ -448,7 +481,7 @@ def get_backend(api_key: str | None) -> Any:
             try:
                 backend = AnthropicBackend(settings, key)
             except LLMError as exc:
-                raise ApiError(exc.code, exc.message, exc.status) from exc
+                raise ApiError(exc.code, exc.message, exc.status, exc.retry_after) from exc
             if len(_backends) > 64:
                 _backends.clear()
             _backends[cache_key] = backend
@@ -507,9 +540,22 @@ class BodySizeLimit:
 
 @asynccontextmanager
 async def _lifespan(_: FastAPI) -> Any:
-    log.info("serving with %s", runtime.describe())
-    yield
-    runtime.store.close()
+    rt = runtime
+    rt.closing = False
+    log.info("serving with %s", rt.describe())
+    if rt.dispatcher is not None:
+        rt.dispatcher.start()
+    try:
+        yield
+    finally:
+        # Shutdown: uvicorn has stopped accepting and waited for the requests in flight (at most
+        # SOP_SHUTDOWN_GRACE_SECONDS). A turn still running now is not committed (_run_turn); its
+        # hold on the conversation is released, or lapses within one lease, and the client's
+        # retry is answered by another instance.
+        rt.closing = True
+        if rt.dispatcher is not None:
+            await anyio.to_thread.run_sync(rt.dispatcher.stop)
+        rt.store.close()
 
 
 app = FastAPI(title=APP_NAME, docs_url="/api/docs", redoc_url=None, lifespan=_lifespan)
@@ -551,6 +597,8 @@ class NewSession(BaseModel):
 
 class NewMessage(BaseModel):
     text: str = Field(min_length=1, max_length=MAX_MESSAGE_CHARS)
+    # Optional, chosen by the client once per message and sent again with every retry of it.
+    message_id: str | None = None
 
 
 def _client_of(request: Request) -> str:
@@ -588,7 +636,44 @@ def _store_unavailable() -> ApiError:
 
 @app.get("/healthz")
 async def healthz() -> dict[str, str]:
+    """Liveness: the process answers. Says nothing about the store (see /readyz)."""
     return {"status": "ok"}
+
+
+_ready_state = {"ready": True}  # the last answer of /readyz, so only a change is logged
+
+
+@app.get("/readyz", response_model=None)
+async def readyz() -> dict[str, str] | JSONResponse:
+    """Readiness: this instance can serve conversations, i.e. its store answers (within ~2 s)
+    and it is not shutting down. 503 not_ready otherwise, for a load balancer to route around it."""
+    rt = runtime
+    reason = "shutting_down" if rt.closing else ""
+    if not reason:
+        try:
+            with anyio.fail_after(READY_TIMEOUT_SECONDS):
+                await anyio.to_thread.run_sync(
+                    rt.store.ping, abandon_on_cancel=True, limiter=_thread_limiter(_ping_threads, 2)
+                )
+        except TimeoutError:
+            reason = "store_timeout"
+        except StoreError as exc:
+            reason = f"store_unavailable ({type(exc).__name__})"
+    ready = not reason
+    if ready != _ready_state["ready"]:
+        _ready_state["ready"] = ready
+        if ready:
+            log.info("ready again: the session store answers")
+        else:
+            log.warning("not ready: %s", reason)
+    if ready:
+        return {"status": "ready"}
+    message = (
+        "This instance is shutting down."
+        if rt.closing
+        else "This instance cannot reach its session store right now."
+    )
+    return error_response(503, "not_ready", message, retry_after=1)
 
 
 @app.get("/api/config")
@@ -624,10 +709,17 @@ async def get_stats() -> dict[str, Any]:
     except StoreError:
         store = {"kind": rt.store.kind, "unavailable": True}
     pid = os.getpid()
+    dispatcher = (
+        rt.dispatcher.snapshot()
+        if rt.dispatcher is not None
+        else {"enabled": False, "running": False, "note": "SOP_DISPATCH=off: another process delivers"}
+    )
     return {
         "uptime_seconds": round(time.monotonic() - rt.stats.started, 1),
         "process": {"pid": pid},
         "store": store,
+        "model": llm.model_health(),
+        "dispatcher": dispatcher,
         "turn_slots": {"in_use": rt.slots.in_use, "max": rt.slots.size, "waiting": rt.slots.waiting},
         "counters": {
             "scope": f"this process (pid {pid}) since it started; each worker or instance counts its own",
@@ -689,11 +781,21 @@ def create_session(request: Request, body: NewSession | None = None) -> dict[str
     }
 
 
+def _deliveries(store: SessionStore, session_id: str, state: SessionState) -> dict[str, dict[str, Any]]:
+    """Effect key -> delivery ({status, attempts, sent_at}) of what the conversation queued;
+    the store is asked only if there is something to show."""
+    if not state.outbox and state.escalation is None:
+        return {}
+    return {str(effect["key"]): delivery_of(effect) for effect in store.effects(session_id)}
+
+
 @app.get("/api/sessions/{session_id}")
 def get_session(session_id: str) -> dict[str, Any]:
     _check_session_id(session_id)
+    store = runtime.store
     try:
-        state = runtime.store.read(session_id)
+        state = store.read(session_id)
+        deliveries = _deliveries(store, session_id, state)
     except SessionNotFound as exc:
         raise ApiError("session_not_found", "This conversation no longer exists on the server.", 404) from exc
     except StoreUnavailable as exc:
@@ -701,9 +803,25 @@ def get_session(session_id: str) -> dict[str, Any]:
     return {
         "session_id": state.session_id,
         "messages": state.messages,
-        "state": state.to_view(settings),
+        "state": with_delivery(state.to_view(settings), deliveries),
         "traces": state.traces,
     }
+
+
+@app.get("/api/sessions/{session_id}/audit")
+def get_audit(session_id: str) -> dict[str, Any]:
+    """The conversation's audit events and its queued effects with their delivery status (no
+    payloads: no addresses, no e-mail text). Kept after the conversation itself expires."""
+    _check_session_id(session_id)
+    store = runtime.store
+    try:
+        events = store.audit(session_id)
+        effects = store.effects(session_id)
+    except StoreUnavailable as exc:
+        raise _store_unavailable() from exc
+    if not events and not effects:
+        raise ApiError("session_not_found", "Nothing is recorded for this conversation.", 404)
+    return {"session_id": session_id, "events": events, "effects": effects}
 
 
 @app.post("/api/sessions/{session_id}/messages")
@@ -717,6 +835,9 @@ async def post_message(
         text.encode("utf-8")
     except UnicodeEncodeError:  # e.g. a lone surrogate from a \ud800 escape: not text
         raise ApiError("bad_request", "The message contains characters that are not valid text.", 400) from None
+    message_id = body.message_id
+    if message_id is not None and not MESSAGE_ID.fullmatch(message_id):
+        raise ApiError("bad_request", "message_id must be 8 to 64 letters, digits, '-' or '_'.", 400)
     _check_session_id(session_id)
     _rate_limit(request, "turn")
     rt = runtime
@@ -732,36 +853,89 @@ async def post_message(
         )
     try:
         return await anyio.to_thread.run_sync(
-            _run_turn, rt, session_id, text, x_api_key, limiter=_turn_thread_limiter(rt.slots.size)
+            _run_turn, rt, session_id, text, x_api_key, message_id, limiter=_turn_thread_limiter(rt.slots.size)
         )
     finally:
         rt.slots.release()
 
 
-def _run_turn(rt: Runtime, session_id: str, text: str, api_key: str | None) -> dict[str, Any]:
-    """One turn, on a worker thread, holding a turn slot."""
+def _answered(state: SessionState, message_id: str, text: str) -> tuple[str, dict[str, Any] | None] | None:
+    """The stored answer to the caller message that carried `message_id`: (reply, trace), or
+    None if the transcript holds no message with that id. The same id with other text is a
+    client error (409 message_id_reused), not a retry."""
+    messages = state.messages
+    for index, message in enumerate(messages):
+        if not (isinstance(message, dict) and message.get("role") == "user" and message.get("id") == message_id):
+            continue
+        if message.get("text") != text:
+            raise ApiError(
+                "message_id_reused",
+                "This message id was already used for a different message; a new message needs a new id.",
+                409,
+            )
+        turn = message.get("turn")
+        reply = next(
+            (
+                str(later.get("text", ""))
+                for later in messages[index + 1:]
+                if isinstance(later, dict) and later.get("role") == "assistant" and later.get("turn") == turn
+            ),
+            "",
+        )
+        trace = next((t for t in state.traces if isinstance(t, dict) and t.get("turn") == turn), None)
+        return reply, trace
+    return None
+
+
+def _run_turn(
+    rt: Runtime, session_id: str, text: str, api_key: str | None, message_id: str | None = None
+) -> dict[str, Any]:
+    """One turn, on a worker thread, holding a turn slot.
+
+    With a `message_id` that the transcript already holds (a retry of a message that was
+    answered), the stored answer is returned instead ("replayed": true): the engine does not run
+    and nothing is written. Otherwise the turn runs, and the effects it decided on (the summary
+    e-mail, the handoff) are queued with its commit, for the dispatcher to deliver."""
     started = time.perf_counter()
     status, code, phase_before = 200, "", "?"  # "?": the conversation was never read
     trace: dict[str, Any] | None = None
+    stored: tuple[str, dict[str, Any] | None] | None = None
+    queued: list[dict[str, Any]] = []
     try:
         with rt.store.turn(session_id, wait=rt.settings.conversation_wait_seconds) as held:
             state = held.state  # a private copy: the store hands one out per turn
             phase_before = state.phase.value
-            backend = get_backend(api_key)
-            try:
-                reply, trace = agent.handle_turn(state, text, backend)
-            except ConversationClosed as exc:
-                rt.stats.count("closed_at_message_limit_409")
-                raise ApiError("conversation_closed", str(exc), 409) from exc
-            except LLMError as exc:
-                rt.stats.count("model_errors")
-                raise ApiError(exc.code, exc.message, exc.status) from exc
-            except Exception as exc:  # noqa: BLE001 - surface as a clean API error
-                rt.stats.count("model_errors")
-                log.exception("turn failed")
-                raise ApiError("llm_error", f"The turn could not be processed ({type(exc).__name__}).", 502) from exc
-            # Committed only now: a failed turn leaves the conversation exactly as it was.
-            held.commit()
+            # Before anything else, including the message cap: a retry of the last message a
+            # conversation may hold still gets its answer.
+            if message_id is not None:
+                stored = _answered(state, message_id, text)
+            if stored is None:
+                backend = get_backend(api_key)
+                outbox_before, had_escalation = len(state.outbox), state.escalation is not None
+                try:
+                    with llm.turn_budget(rt.settings.turn_budget_seconds):
+                        reply, trace = agent.handle_turn(state, text, backend, message_id=message_id)
+                except ConversationClosed as exc:
+                    rt.stats.count("closed_at_message_limit_409")
+                    raise ApiError("conversation_closed", str(exc), 409) from exc
+                except LLMError as exc:
+                    rt.stats.count("model_errors")
+                    raise ApiError(exc.code, exc.message, exc.status, exc.retry_after) from exc
+                except Exception as exc:  # noqa: BLE001 - surface as a clean API error
+                    rt.stats.count("model_errors")
+                    log.exception("turn failed")
+                    raise ApiError("llm_error", f"The turn could not be processed ({type(exc).__name__}).", 502) from exc
+                queued = turn_effects(state, outbox_before, had_escalation)
+                if rt.closing:
+                    # Past the shutdown's grace period: the store is about to close, so this turn
+                    # is not committed; the client's retry runs it again (on another instance).
+                    raise ApiError(
+                        "server_busy", "This server is shutting down; please send the message again.", 503,
+                        retry_after=1,
+                    )
+                # Committed only now, with its effects: a failed turn leaves the conversation
+                # exactly as it was and queues nothing.
+                held.commit(effects=queued)
     except ApiError as exc:
         status, code = exc.status, exc.code
         raise
@@ -782,9 +956,21 @@ def _run_turn(rt: Runtime, session_id: str, text: str, api_key: str | None) -> d
         raise _store_unavailable() from None
     finally:
         elapsed = time.perf_counter() - started
-        _log_turn(session_id, phase_before, trace, status, code, elapsed)
+        _log_turn(session_id, phase_before, trace, status, "replayed" if stored is not None else code, elapsed)
+    if stored is not None:
+        rt.stats.count("replayed_messages")
+        try:
+            deliveries = _deliveries(rt.store, session_id, state)
+        except StoreError:  # the answer matters more than its delivery status
+            deliveries = {}
+        reply, trace = stored
+        return {"reply": reply, "state": with_delivery(state.to_view(settings), deliveries), "trace": trace,
+                "replayed": True}
     rt.stats.turn_answered(elapsed)
-    return {"reply": reply, "state": state.to_view(settings), "trace": trace}
+    # What this turn queued is shown as queued without asking the store again; a later read of
+    # the conversation shows how its delivery went.
+    view = with_delivery(state.to_view(settings), {effect["key"]: QUEUED for effect in queued})
+    return {"reply": reply, "state": view, "trace": trace, "replayed": False}
 
 
 def _log_turn(

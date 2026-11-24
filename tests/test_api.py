@@ -167,9 +167,9 @@ def test_concurrent_messages_to_one_conversation_are_serialised(client, monkeypa
 
     real_turn = server.agent.handle_turn
 
-    def slow_turn(state, text, backend):
+    def slow_turn(state, text, backend, **kwargs):
         time.sleep(0.15)  # hold the turn open so the other requests are genuinely waiting
-        return real_turn(state, text, backend)
+        return real_turn(state, text, backend, **kwargs)
 
     monkeypatch.setattr(server.agent, "handle_turn", slow_turn)
     sid = client.post("/api/sessions", json={}).json()["session_id"]

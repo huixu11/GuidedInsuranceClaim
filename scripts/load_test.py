@@ -12,6 +12,10 @@ it, not just the status codes:
   sent or skipped, handed to a human), so one caller's state never bleeds into another's;
 - no reply mentions a claim number that belongs to a different policyholder.
 
+Every message carries its own `message_id`, sent again with each retry of it (a "busy" answer, a
+broken connection), as the browser does: a retry of a message that was answered is answered
+from the transcript ("replayed") and never runs the turn twice.
+
 With several base URLs each request goes to the next one in turn, so a conversation is served by
 all of them. That only works when the instances share a session store.
 
@@ -28,6 +32,7 @@ import statistics
 import sys
 import threading
 import time
+import uuid
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from urllib.parse import urlparse
@@ -37,6 +42,7 @@ DEMO = ("I'm the policyholder. My name is Margaret Chen, policy POL-9921. I'm ca
         "healthcare claim from January. DOB is 1985-03-15, SSN last four is 4472.")
 
 _local = threading.local()
+REPLAYED: Counter = Counter()
 
 
 class TurnFailed(Exception):
@@ -119,19 +125,36 @@ class Caller:
 
     def say(self, text: str) -> None:
         before = self.state.get("turn", 0)
-        data = self._request("POST", f"/api/sessions/{self.sid}/messages", {"text": text}, timed=True)
+        body = {"text": text, "message_id": uuid.uuid4().hex}  # one id per message, kept for its retries
+        data = self._request("POST", f"/api/sessions/{self.sid}/messages", body, timed=True)
+        if data.get("replayed"):
+            REPLAYED["messages"] += 1  # a retry of a message whose answer was lost on the way back
         self.state = data["state"]
         self.replies.append(data["reply"])
         if self.state["turn"] != before + 1:
             raise AssertionError(f"turn counter went {before} -> {self.state['turn']}")
 
     def reread(self) -> None:
-        """What a reload would see must be what the last turn returned."""
+        """What a reload would see must be what the last turn returned (but for the delivery
+        status of a queued e-mail or handoff, which moves on by itself)."""
         data = self._request("GET", f"/api/sessions/{self.sid}", None, timed=False)
-        if data["state"] != self.state:
+        if without_delivery(data["state"]) != without_delivery(self.state):
             raise AssertionError("state read back differs from the state the last turn returned")
         if len([m for m in data["messages"] if m["role"] == "user"]) != self.state["turn"]:
             raise AssertionError("transcript length does not match the turn counter")
+        ids = [m.get("id") for m in data["messages"] if m["role"] == "user"]
+        if None in ids or len(set(ids)) != len(ids):
+            raise AssertionError("a caller message is stored without its id, or two share one")
+
+
+def without_delivery(state: dict) -> dict:
+    out = json.loads(json.dumps(state))
+    for entry in (out.get("email") or {}).get("outbox") or []:
+        if isinstance(entry, dict):
+            entry.pop("delivery", None)
+    if isinstance(out.get("escalation"), dict):
+        out["escalation"].pop("delivery", None)
+    return out
 
 
 def expect(cond: bool, what: str) -> None:
@@ -232,8 +255,9 @@ def burst_on_one_conversation(bases: list[str], n: int) -> str:
 
     def send(k: int) -> None:
         status = 0
+        body = {"text": "What is RL?", "message_id": uuid.uuid4().hex}  # n messages: n ids
         for _ in range(60):
-            status, _, headers = call(bases[k % len(bases)], "POST", f"/api/sessions/{c.sid}/messages", {"text": "What is RL?"})
+            status, _, headers = call(bases[k % len(bases)], "POST", f"/api/sessions/{c.sid}/messages", body)
             if status not in (409, 429, 503):
                 break
             time.sleep(0.1)
@@ -317,6 +341,8 @@ def main() -> int:
               f"p99 {pct(latencies, 99) * 1000:.0f} ms | max {max(latencies) * 1000:.0f} ms")
     if retries:
         print("asked to come back later:", dict(retries))
+    if REPLAYED:
+        print(f"answered from the transcript after a retry (replayed): {REPLAYED['messages']}")
     for line in failures:
         print("  WRONG", line)
 

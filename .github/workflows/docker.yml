@@ -6,6 +6,11 @@ name: docker
 # test (scripts/load_test.py) then runs against one offline container, and against two
 # containers that share a SQLite session store on a volume, every conversation alternating
 # between them.
+#
+# The test suite runs with a real PostgreSQL next to it, so the store tests cover all three
+# stores, and the failover test (scripts/failover_test.py) kills one of three instances in the
+# middle of a run, on SQLite and on PostgreSQL. The last job starts docker-compose.ha.yml (three
+# instances behind a load balancer on PostgreSQL), kills a container mid-run and starts it again.
 
 on:
   push:
@@ -146,13 +151,118 @@ jobs:
           echo "--- shared store, container B (two workers) ---"; docker logs sop-shared-b || true
 
   tests:
-    name: Test suite on the image's Python
+    name: Test suite on the image's Python, with PostgreSQL
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 2s
+          --health-timeout 3s
+          --health-retries 30
+    env:
+      # A throwaway database of this job; nothing else can reach it.
+      PG_URL: postgresql://postgres:postgres@127.0.0.1:5432/postgres
     steps:
       - uses: actions/checkout@v6
 
-      - name: pytest inside python:3.14-slim
+      - name: pytest inside python:3.14-slim (memory, SQLite and PostgreSQL stores)
         run: |
-          docker run --rm -v "$PWD":/src -w /src -e PYTHONDONTWRITEBYTECODE=1 python:3.14-slim \
-            sh -c "pip install --no-cache-dir --quiet --root-user-action=ignore -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider"
+          docker run --rm --network host -v "$PWD":/src -w /src -e PYTHONDONTWRITEBYTECODE=1 \
+            -e SOP_TEST_POSTGRES_URL="$PG_URL" python:3.14-slim \
+            sh -c "pip install --no-cache-dir --quiet --root-user-action=ignore -r requirements-dev.txt && python -m pytest -q -p no:cacheprovider -rs"
+
+      - name: Failover on SQLite (one of three instances is killed mid-run and comes back)
+        run: |
+          docker run --rm --network host -v "$PWD":/src -w /src -e PYTHONDONTWRITEBYTECODE=1 python:3.14-slim \
+            sh -c "pip install --no-cache-dir --quiet --root-user-action=ignore -r requirements.txt && python -u scripts/failover_test.py"
+
+      - name: Failover on PostgreSQL (one of three instances is killed mid-run and comes back)
+        run: |
+          docker run --rm --network host -v "$PWD":/src -w /src -e PYTHONDONTWRITEBYTECODE=1 python:3.14-slim \
+            sh -c "pip install --no-cache-dir --quiet --root-user-action=ignore -r requirements.txt && python -u scripts/failover_test.py --store '$PG_URL'"
+
+  ha:
+    name: Three instances behind a load balancer on PostgreSQL; one is killed
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      SOP_LLM_MODE: mock
+      PORT: "8080"
+      LB: http://127.0.0.1:8080
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Start PostgreSQL, three instances and the load balancer
+        run: docker compose -f docker-compose.ha.yml up --build -d --wait --wait-timeout 240
+
+      - name: Every instance is ready and uses the one database
+        run: |
+          cat > /tmp/check_instance.py <<'EOF'
+          import json, urllib.request
+          ready = json.load(urllib.request.urlopen("http://127.0.0.1:8000/readyz", timeout=5))
+          store = json.load(urllib.request.urlopen("http://127.0.0.1:8000/api/stats", timeout=5))["store"]
+          print(ready, store["kind"], "shared" if store["shared_between_processes"] else "not shared")
+          assert ready.get("status") == "ready" and store["kind"] == "postgres" and store["shared_between_processes"]
+          EOF
+          for app in app1 app2 app3; do
+            echo "--- $app"
+            docker compose -f docker-compose.ha.yml exec -T "$app" python - < /tmp/check_instance.py
+          done
+
+      - name: Every requirement of the brief, through the load balancer
+        run: python3 scripts/spec_check.py "$LB"
+
+      - name: Load test through the load balancer (every conversation checked)
+        run: python3 scripts/load_test.py "$LB" --callers 300 --concurrency 60
+
+      - name: Kill one instance in the middle of a run, start it again; nothing is lost or doubled
+        env:
+          # The instances are re-created with a slower offline double, so that turns are in flight
+          # when one dies, and a shorter lease, so that what it held is free again quickly.
+          SOP_MOCK_LATENCY_MS: "350"
+          SOP_TURN_LEASE_SECONDS: "6"
+        run: |
+          docker compose -f docker-compose.ha.yml up -d --wait --wait-timeout 240
+          python3 -u scripts/failover_test.py --urls "$LB" --lease 6 \
+            --kill-cmd "docker kill sop-ha-app2-1" --restart-cmd "docker start sop-ha-app2-1"
+
+      - name: The restarted instance is ready again and the load balancer still serves
+        run: |
+          for i in $(seq 1 60); do
+            health=$(docker inspect --format '{{.State.Health.Status}}' sop-ha-app2-1)
+            echo "$(date +%T) app2: $health"
+            if [ "$health" = "healthy" ]; then break; fi
+            sleep 2
+          done
+          test "$health" = "healthy"
+          docker compose -f docker-compose.ha.yml ps
+          python3 scripts/spec_check.py "$LB"
+
+      - name: The database goes away and comes back; the instances recover without a restart
+        run: |
+          docker compose -f docker-compose.ha.yml stop db
+          sleep 3
+          code=$(curl -s -o /tmp/down.json -w '%{http_code}' -X POST "$LB/api/sessions" -H 'Content-Type: application/json' -d '{}' || true)
+          echo "new conversation while the database is down: HTTP $code $(cat /tmp/down.json 2>/dev/null)"
+          test "$code" = 503 -o "$code" = 502
+          docker compose -f docker-compose.ha.yml start db
+          for i in $(seq 1 60); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "$LB/readyz" || true)
+            if [ "$code" = 200 ]; then break; fi
+            sleep 2
+          done
+          echo "ready again after the database came back: HTTP $code"
+          test "$code" = 200
+          docker compose -f docker-compose.ha.yml ps
+          python3 scripts/spec_check.py "$LB"
+
+      - name: Logs
+        if: always()
+        run: docker compose -f docker-compose.ha.yml logs --no-color --tail 200
